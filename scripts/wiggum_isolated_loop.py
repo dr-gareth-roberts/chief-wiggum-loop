@@ -73,21 +73,32 @@ def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def append_jsonl(path: Path, entry: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, sort_keys=True) + "\n")
+def append_jsonl(path: Path, entry: dict[str, Any]) -> Exception | None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, sort_keys=True) + "\n")
+    except (PermissionError, OSError) as exc:
+        return exc
+    return None
 
 
 def append_log(cwd: Path, entry: dict[str, Any]) -> None:
     append_jsonl(cwd / LOG_REL, {"timestamp": utc_now(), **entry})
 
 
+_GLOBAL_LESSONS_WARNED = False
+
+
 def append_lesson(cwd: Path, lesson: dict[str, Any], global_enabled: bool = True) -> None:
+    global _GLOBAL_LESSONS_WARNED
     entry = {"timestamp": utc_now(), "cwd": str(cwd), **lesson}
     append_jsonl(cwd / PROJECT_LESSONS_REL, entry)
     if global_enabled:
-        append_jsonl(GLOBAL_LESSONS, entry)
+        exc = append_jsonl(GLOBAL_LESSONS, entry)
+        if exc is not None and not _GLOBAL_LESSONS_WARNED:
+            _GLOBAL_LESSONS_WARNED = True
+            append_log(cwd, {"event": "global_lessons_disabled", "reason": str(exc)})
 
 
 def archive_state(cwd: Path, state: dict[str, Any], reason: str) -> Path | None:
@@ -735,7 +746,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--max-estimated-tokens", type=int, default=0)
     p.add_argument("--human-checkpoint", choices=["never", "always", "on-stuck", "on-critic"], default="never")
     p.add_argument("--human-checkpoint-every", type=int, default=0)
-    p.add_argument("--no-global-lessons", action="store_true", help="Do not append to ~/.wiggum/lessons.jsonl")
+    p.add_argument("--global-lessons", action="store_true", help="Opt in to appending lessons to ~/.wiggum/lessons.jsonl (default: project-only)")
+    p.add_argument("--no-global-lessons", action="store_true", help="Deprecated alias kept for backwards compatibility; global lessons are now opt-in via --global-lessons")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
     preset = PRESETS.get(args.preset, {})
@@ -786,6 +798,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     cwd = Path.cwd()
+    # Global lessons are now opt-in: --global-lessons turns them on;
+    # the legacy --no-global-lessons flag still suppresses them.
+    global_enabled = bool(args.global_lessons) and not bool(args.no_global_lessons)
     core_prompt = read_prompt(args)
     if not core_prompt:
         print("No prompt provided. Pass prompt text or --prompt-file.", file=sys.stderr)
@@ -925,7 +940,7 @@ def main(argv: list[str]) -> int:
         state["last_summary_chars"] = len(updated_summary)
         append_log(cwd, round_info)
         if stuck_reason:
-            append_lesson(cwd, {"event": "iteration_lesson", "iteration": iteration, "stuck_reason": stuck_reason, "summary": compact_text(best.get("output_tail", ""), 500)}, not args.no_global_lessons)
+            append_lesson(cwd, {"event": "iteration_lesson", "iteration": iteration, "stuck_reason": stuck_reason, "summary": compact_text(best.get("output_tail", ""), 500)}, global_enabled)
         critic = run_critic_if_due(cwd, core_prompt, args, state, iteration)
         if critic:
             state["last_critic"] = critic
@@ -942,7 +957,7 @@ def main(argv: list[str]) -> int:
                 render_dashboard(cwd, state)
                 print(f"✅ Completion promise detected; archived state at {archive}")
                 return 0
-            append_lesson(cwd, {"event": "review_veto", "reason": "promise", "iteration": iteration}, not args.no_global_lessons)
+            append_lesson(cwd, {"event": "review_veto", "reason": "promise", "iteration": iteration}, global_enabled)
             print("⚠️ Final reviewer did not approve promise exit; continuing.", flush=True)
 
         verifier_success = best.get("verifier_exit_code") == 0
@@ -957,7 +972,7 @@ def main(argv: list[str]) -> int:
                 if args.review_command:
                     print("✅ Final review approved success exit.", flush=True)
                 return 0
-            append_lesson(cwd, {"event": "review_veto", "reason": "verifier", "iteration": iteration}, not args.no_global_lessons)
+            append_lesson(cwd, {"event": "review_veto", "reason": "verifier", "iteration": iteration}, global_enabled)
             print("⚠️ Final reviewer did not approve verifier exit; continuing.", flush=True)
 
         if args.human_checkpoint_every and iteration % args.human_checkpoint_every == 0:
@@ -972,7 +987,7 @@ def main(argv: list[str]) -> int:
                 return 0
             archive = archive_state(cwd, state, "stuck")
             append_log(cwd, {"event": "pause", "reason": "stuck", "iteration": iteration, "archive": str(archive)})
-            append_lesson(cwd, {"event": "stuck_pause", "iteration": iteration, "stuck_reason": stuck_reason}, not args.no_global_lessons)
+            append_lesson(cwd, {"event": "stuck_pause", "iteration": iteration, "stuck_reason": stuck_reason}, global_enabled)
             render_dashboard(cwd, state)
             print(f"⏸️ Paused after {stagnant} no-progress isolated iteration(s); archived state at {archive}")
             return 0
