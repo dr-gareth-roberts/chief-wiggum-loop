@@ -702,6 +702,35 @@ def budget_exceeded(args: argparse.Namespace, state: dict[str, Any], started: fl
     return ""
 
 
+def validate_agent_commands(commands: list[str], skip: bool) -> list[str]:
+    """Probe each agent command with a no-op stdin. Returns error strings for any
+    command that exits 127 (not found) or fails almost instantly (<0.5s, non-zero,
+    not a timeout) — those are the classic "command missing / shell error" shapes.
+
+    Validation runs in a temporary directory so it never pollutes the caller's
+    workspace (e.g. agent commands that log into the cwd as a side effect).
+    """
+    if skip:
+        return []
+    errors: list[str] = []
+    tmp = Path(tempfile.mkdtemp(prefix="wiggum-validate-"))
+    try:
+        for cmd in commands:
+            result = run_shell(cmd, tmp, 5, "noop\n")
+            exit_code = int(result.get("exit_code") or 0)
+            duration = float(result.get("duration_seconds") or 0.0)
+            timeout = bool(result.get("timeout"))
+            if exit_code == 127 or (exit_code != 0 and duration < 0.5 and not timeout):
+                tail = str(result.get("output") or "").strip()[-400:]
+                errors.append(
+                    f"agent command failed startup probe (exit={exit_code}, duration={duration:.2f}s): {cmd}"
+                    + (f"\n  output: {tail}" if tail else "")
+                )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return errors
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run a true-isolated Wiggum loop using fresh agent subprocesses.")
     p.add_argument("prompt", nargs="*", help="Core prompt text")
@@ -741,6 +770,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--human-checkpoint", choices=["never", "always", "on-stuck", "on-critic"], default="never")
     p.add_argument("--human-checkpoint-every", type=int, default=0)
     p.add_argument("--no-global-lessons", action="store_true", help="Do not append to ~/.wiggum/lessons.jsonl")
+    p.add_argument("--no-agent-validation", action="store_true", help="Skip the startup probe that runs each --agent-command with stdin to catch missing/broken commands")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
     preset = PRESETS.get(args.preset, {})
@@ -841,6 +871,12 @@ def main(argv: list[str]) -> int:
     if args.dry_run:
         print(build_iteration_prompt(core_prompt, args, 1, 0, None, read_summary(cwd, args.summary_max_chars)))
         return 0
+    validation_errors = validate_agent_commands(list(args.agent_command), args.no_agent_validation)
+    if validation_errors:
+        for err in validation_errors:
+            print(f"[wiggum] agent command validation error: {err}", file=sys.stderr)
+        print("[wiggum] aborting; pass --no-agent-validation to bypass", file=sys.stderr)
+        return 2
     print(f"🔁 Wiggum isolated loop starting: mode={args.mode}, agents={args.agent_command!r}, candidates={args.candidates}", flush=True)
     last_agent: dict[str, Any] | None = None
     mutation_hint = ""
