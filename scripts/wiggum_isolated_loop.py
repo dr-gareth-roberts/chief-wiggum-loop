@@ -277,21 +277,30 @@ def cleanup_candidate_workspace(cwd: Path, candidate_cwd: Path, kind: str, tmp_r
         shutil.rmtree(tmp_root, ignore_errors=True)
 
 
-def parse_metrics(text: str) -> dict[str, float]:
+def parse_metrics(text: str, metric_name: str = "") -> dict[str, float]:
+    # The METRIC-prefixed form always parses; the bare 'name=value' form
+    # is only honored when it matches the explicit metric_name the caller
+    # is tracking, so unrelated 'foo=bar' lines in agent output don't get
+    # mistakenly promoted to metrics.
+    prefixed = r"^\s*METRIC\s+([A-Za-z0-9_.:-]+)\s*=\s*(-?\d+(?:\.\d+)?)\s*$"
+    bare = r"^\s*([A-Za-z0-9_.:-]+)\s*=\s*(-?\d+(?:\.\d+)?)\s*$"
     metrics: dict[str, float] = {}
-    patterns = [
-        r"^\s*METRIC\s+([A-Za-z0-9_.:-]+)\s*=\s*(-?\d+(?:\.\d+)?)\s*$",
-        r"^\s*([A-Za-z0-9_.:-]+)\s*=\s*(-?\d+(?:\.\d+)?)\s*$",
-    ]
     for line in text.splitlines():
-        for pattern in patterns:
-            m = re.match(pattern, line)
-            if m:
-                try:
-                    metrics[m.group(1)] = float(m.group(2))
-                except ValueError:
-                    pass
-                break
+        m = re.match(prefixed, line)
+        if m:
+            try:
+                metrics[m.group(1)] = float(m.group(2))
+            except ValueError:
+                pass
+            continue
+        if not metric_name:
+            continue
+        m = re.match(bare, line)
+        if m and m.group(1) == metric_name:
+            try:
+                metrics[m.group(1)] = float(m.group(2))
+            except ValueError:
+                pass
     return metrics
 
 
@@ -554,7 +563,7 @@ def run_candidate(cwd: Path, core_prompt: str, args: argparse.Namespace, state: 
     agent = run_agent(agent_command, prompt, candidate_cwd, args.agent_timeout, iteration)
     postcheck = run_shell(args.success_command, candidate_cwd, args.success_timeout) if args.success_command else None
     combined_output = (agent.get("output_tail") or "") + "\n" + (str(postcheck.get("output") or "") if postcheck else "")
-    metrics = parse_metrics(combined_output)
+    metrics = parse_metrics(combined_output, args.metric_name)
     metric_value = metrics.get(args.metric_name) if args.metric_name else None
     # Only mark untracked files inside a real candidate sandbox so the
     # user's main-tree index is never mutated as a side-effect of patch
