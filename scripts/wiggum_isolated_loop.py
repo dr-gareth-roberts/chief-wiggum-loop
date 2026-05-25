@@ -45,6 +45,9 @@ DEFAULT_VARIANTS = [
     "Stall-breaker: if no user files changed last iteration, modify the most relevant file now.",
 ]
 
+# Shared refusal regex; applied to the LAST 800 chars of output, never the full stream.
+REFUSAL_REGEX = re.compile(r"\b(can't|cannot|unable to|give up|not possible|as an ai)\b", re.I)
+
 PRESETS: dict[str, dict[str, Any]] = {
     "none": {},
     "coding": {"mode": "variants", "agent_switch_every": 4, "critic_every": 4},
@@ -497,8 +500,6 @@ def classify_stuck_reason(candidate: dict[str, Any], stagnant: int, previous_fai
     verifier = str(candidate.get("verifier_output_tail") or "")
     if candidate.get("agent_timeout") or candidate.get("timeout"):
         return "agent_timeout"
-    if re.search(r"\b(can't|cannot|unable to|give up|not possible|as an ai)\b", output, re.I):
-        return "model_refusal_or_give_up"
     if stagnant > 0:
         return "no_workspace_progress"
     if candidate.get("verifier_exit_code") not in (None, 0) and not verifier.strip():
@@ -510,6 +511,10 @@ def classify_stuck_reason(candidate: dict[str, Any], stagnant: int, previous_fai
         return "metric_missing"
     if candidate.get("accepted") is False:
         return "patch_rejected_by_policy"
+    # Refusal regex is the LAST resort and only scans the tail to avoid matching
+    # incidental language earlier in long agent outputs.
+    if REFUSAL_REGEX.search(output[-800:]):
+        return "model_refusal_or_give_up"
     return ""
 
 
@@ -626,7 +631,7 @@ def candidate_rank(candidate: dict[str, Any], args: argparse.Namespace, best_met
 def candidate_accepted(candidate: dict[str, Any], args: argparse.Namespace, state: dict[str, Any], baseline_hash: str) -> bool:
     policy = args.acceptance
     if policy == "auto":
-        policy = "metric" if args.metric_name else "verifier" if args.success_command and (args.sandbox != "none" or args.candidates > 1) else "always"
+        policy = "metric" if args.metric_name else ("verifier" if args.success_command else "always")
     if policy == "always":
         return True
     if policy == "verifier":
@@ -745,6 +750,35 @@ def budget_exceeded(args: argparse.Namespace, state: dict[str, Any], started: fl
     return ""
 
 
+def validate_agent_commands(commands: list[str], skip: bool) -> list[str]:
+    """Probe each agent command with a no-op stdin. Returns error strings for any
+    command that exits 127 (not found) or fails almost instantly (<0.5s, non-zero,
+    not a timeout) — those are the classic "command missing / shell error" shapes.
+
+    Validation runs in a temporary directory so it never pollutes the caller's
+    workspace (e.g. agent commands that log into the cwd as a side effect).
+    """
+    if skip:
+        return []
+    errors: list[str] = []
+    tmp = Path(tempfile.mkdtemp(prefix="wiggum-validate-"))
+    try:
+        for cmd in commands:
+            result = run_shell(cmd, tmp, 5, "noop\n")
+            exit_code = int(result.get("exit_code") or 0)
+            duration = float(result.get("duration_seconds") or 0.0)
+            timeout = bool(result.get("timeout"))
+            if exit_code == 127 or (exit_code != 0 and duration < 0.5 and not timeout):
+                tail = str(result.get("output") or "").strip()[-400:]
+                errors.append(
+                    f"agent command failed startup probe (exit={exit_code}, duration={duration:.2f}s): {cmd}"
+                    + (f"\n  output: {tail}" if tail else "")
+                )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return errors
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run a true-isolated Wiggum loop using fresh agent subprocesses.")
     p.add_argument("prompt", nargs="*", help="Core prompt text")
@@ -762,7 +796,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--metric-name", default="", help="Metric name parsed from `METRIC name=value` lines")
     p.add_argument("--metric-direction", choices=["lower", "higher"], default="higher")
     p.add_argument("--acceptance", choices=["auto", "always", "verifier", "metric", "progress"], default="auto", help="Patch acceptance policy")
-    p.add_argument("--sandbox", choices=["none", "worktree", "copy"], default="none", help="Run worker in main tree or isolated candidate workspace")
+    p.add_argument("--sandbox", choices=["none", "worktree", "copy"], default=None, help="Run worker in main tree or isolated candidate workspace; default auto-upgrades to worktree when in a git repo with HEAD")
     p.add_argument("--candidates", type=int, default=1, help="Best-of-N candidates per iteration")
     p.add_argument("--candidate-concurrency", type=int, default=1, help="Parallel candidate workers")
     p.add_argument("--stuck-after", type=int, default=3, help="Pause after N no-progress iterations; 0 disables")
@@ -786,6 +820,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--human-checkpoint-every", type=int, default=0)
     p.add_argument("--global-lessons", action="store_true", help="Opt in to appending lessons to ~/.wiggum/lessons.jsonl (default: project-only)")
     p.add_argument("--no-global-lessons", action="store_true", help="Deprecated alias kept for backwards compatibility; global lessons are now opt-in via --global-lessons")
+    p.add_argument("--no-agent-validation", action="store_true", help="Skip the startup probe that runs each --agent-command with stdin to catch missing/broken commands")
+    p.add_argument("--explain", action="store_true", default=False, help="Attach the per-round stuck reason signals to the iteration log entry")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
     preset = PRESETS.get(args.preset, {})
@@ -831,6 +867,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     if not numeric_ok:
         p.error("numeric flags must be non-negative and timeouts/counts must be positive where applicable")
+    if args.sandbox is None:
+        if is_git_repo(Path.cwd()) and has_head(Path.cwd()):
+            args.sandbox = "worktree"
+            print("[wiggum] auto-upgraded --sandbox to worktree (git repo with HEAD detected)", file=sys.stderr)
+        else:
+            args.sandbox = "none"
     return args
 
 
@@ -884,6 +926,12 @@ def main(argv: list[str]) -> int:
     if args.dry_run:
         print(build_iteration_prompt(core_prompt, args, 1, 0, None, read_summary(cwd, args.summary_max_chars)))
         return 0
+    validation_errors = validate_agent_commands(list(args.agent_command), args.no_agent_validation)
+    if validation_errors:
+        for err in validation_errors:
+            print(f"[wiggum] agent command validation error: {err}", file=sys.stderr)
+        print("[wiggum] aborting; pass --no-agent-validation to bypass", file=sys.stderr)
+        return 2
     print(f"🔁 Wiggum isolated loop starting: mode={args.mode}, agents={args.agent_command!r}, candidates={args.candidates}", flush=True)
     last_agent: dict[str, Any] | None = None
     mutation_hint = ""
@@ -939,6 +987,14 @@ def main(argv: list[str]) -> int:
         verifier_tail = str(best.get("verifier_output_tail") or "")
         failure_hash = hashlib.sha256(verifier_tail.encode()).hexdigest() if verifier_tail else ""
         stuck_reason = classify_stuck_reason(best, stagnant, state.get("last_failure_hash") or "")
+        output_for_signals = str(best.get("output_tail") or "")
+        reason_signals = {
+            "regex_hit": bool(REFUSAL_REGEX.search(output_for_signals[-800:])),
+            "stagnant": stagnant > 0,
+            "verifier_changed": failure_hash != state.get("last_failure_hash", ""),
+            "agent_timeout": best.get("agent_timeout") or best.get("timeout"),
+            "metric_missing": bool(best.get("metric_required") and best.get("metric_value") is None),
+        }
         metric_value = best.get("metric_value")
         if args.metric_name and metric_improved(metric_value, state.get("best_metric"), args.metric_direction):
             state["best_metric"] = metric_value
@@ -975,6 +1031,8 @@ def main(argv: list[str]) -> int:
                 for c in candidates
             ],
         }
+        if args.explain:
+            round_info["reason_signals"] = reason_signals
         updated_summary = update_memory_summary(cwd, args, round_info) if args.mode != "exact" else ""
         state["last_summary_chars"] = len(updated_summary)
         append_log(cwd, round_info)
@@ -1023,12 +1081,14 @@ def main(argv: list[str]) -> int:
             if maybe_pause_for_human(cwd, args, state, "stuck"):
                 archive = archive_state(cwd, state, "human-checkpoint")
                 print(f"⏸️ Human checkpoint written for stuck loop; archived state at {archive}")
+                print(f"   stuck cause: signals={reason_signals}", flush=True)
                 return 0
             archive = archive_state(cwd, state, "stuck")
             append_log(cwd, {"event": "pause", "reason": "stuck", "iteration": iteration, "archive": str(archive)})
             append_lesson(cwd, {"event": "stuck_pause", "iteration": iteration, "stuck_reason": stuck_reason}, global_enabled)
             render_dashboard(cwd, state)
             print(f"⏸️ Paused after {stagnant} no-progress isolated iteration(s); archived state at {archive}")
+            print(f"   stuck cause: signals={reason_signals}", flush=True)
             return 0
 
     archive = archive_state(cwd, state, "max-iterations")
