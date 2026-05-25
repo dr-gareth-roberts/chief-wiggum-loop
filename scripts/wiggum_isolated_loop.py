@@ -109,6 +109,21 @@ def append_lesson(cwd: Path, lesson: dict[str, Any], global_enabled: bool = True
             append_log(cwd, {"event": "global_lessons_disabled", "reason": str(exc)})
 
 
+def notify(title: str, message: str, enabled: bool) -> None:
+    # Best-effort macOS desktop notification at terminal-state transitions; any
+    # failure (missing osascript, blocked daemon, etc.) is silently ignored so
+    # the loop never derails on a cosmetic side-effect.
+    if not enabled or sys.platform != "darwin":
+        return
+    safe_title = title.replace('"', "'")
+    safe_message = message.replace('"', "'")
+    script = f'display notification "{safe_message}" with title "{safe_title}"'
+    try:
+        subprocess.run(["osascript", "-e", script], timeout=5, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+
 def archive_state(cwd: Path, state: dict[str, Any], reason: str) -> Path | None:
     state_path = cwd / STATE_REL
     if not state_path.exists():
@@ -822,6 +837,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--no-global-lessons", action="store_true", help="Deprecated alias kept for backwards compatibility; global lessons are now opt-in via --global-lessons")
     p.add_argument("--no-agent-validation", action="store_true", help="Skip the startup probe that runs each --agent-command with stdin to catch missing/broken commands")
     p.add_argument("--explain", action="store_true", default=False, help="Attach the per-round stuck reason signals to the iteration log entry")
+    p.add_argument("--notify", action="store_true", help="On macOS, display a desktop notification when the loop reaches a terminal state")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
     preset = PRESETS.get(args.preset, {})
@@ -943,10 +959,12 @@ def main(argv: list[str]) -> int:
             if maybe_pause_for_human(cwd, args, state, "budget"):
                 archive = archive_state(cwd, state, "human-checkpoint")
                 print(f"⏸️ Human checkpoint written for budget; archived state at {archive}")
+                notify("Wiggum paused", f"human checkpoint after budget at iteration {iteration}", args.notify)
                 return 0
             archive = archive_state(cwd, state, budget)
             append_log(cwd, {"event": "stop", "reason": budget, "iteration": iteration, "archive": str(archive)})
             print(f"🛑 Budget reached ({budget}); archived state at {archive}")
+            notify("Wiggum stopped", f"budget ({budget}) after iteration {iteration}", args.notify)
             return 0
 
         iteration += 1
@@ -958,6 +976,7 @@ def main(argv: list[str]) -> int:
                 archive = archive_state(cwd, state, "pre-verifier")
                 append_log(cwd, {"event": "stop", "reason": "pre_verifier", "iteration": iteration, "archive": str(archive)})
                 print(f"✅ Success command already passes; archived state at {archive}")
+                notify("Wiggum done", f"verifier already passes at iteration {iteration}", args.notify)
                 return 0
 
         baseline_hash = workspace_hash(cwd)
@@ -1053,6 +1072,7 @@ def main(argv: list[str]) -> int:
                 append_log(cwd, {"event": "stop", "reason": "promise", "iteration": iteration, "archive": str(archive)})
                 render_dashboard(cwd, state)
                 print(f"✅ Completion promise detected; archived state at {archive}")
+                notify("Wiggum done", f"promise after iteration {iteration}", args.notify)
                 return 0
             append_lesson(cwd, {"event": "review_veto", "reason": "promise", "iteration": iteration}, global_enabled)
             print("⚠️ Final reviewer did not approve promise exit; continuing.", flush=True)
@@ -1068,6 +1088,7 @@ def main(argv: list[str]) -> int:
                 print(f"✅ Success command passed after iteration {iteration}; archived state at {archive}")
                 if args.review_command:
                     print("✅ Final review approved success exit.", flush=True)
+                notify("Wiggum done", f"verifier passed after iteration {iteration}", args.notify)
                 return 0
             append_lesson(cwd, {"event": "review_veto", "reason": "verifier", "iteration": iteration}, global_enabled)
             print("⚠️ Final reviewer did not approve verifier exit; continuing.", flush=True)
@@ -1076,12 +1097,14 @@ def main(argv: list[str]) -> int:
             if maybe_pause_for_human(cwd, args, state, "scheduled"):
                 archive = archive_state(cwd, state, "human-checkpoint")
                 print(f"⏸️ Human checkpoint written; archived state at {archive}")
+                notify("Wiggum paused", f"scheduled human checkpoint at iteration {iteration}", args.notify)
                 return 0
         if args.stuck_after and stagnant >= args.stuck_after:
             if maybe_pause_for_human(cwd, args, state, "stuck"):
                 archive = archive_state(cwd, state, "human-checkpoint")
                 print(f"⏸️ Human checkpoint written for stuck loop; archived state at {archive}")
                 print(f"   stuck cause: signals={reason_signals}", flush=True)
+                notify("Wiggum paused", f"human checkpoint for stuck loop at iteration {iteration}", args.notify)
                 return 0
             archive = archive_state(cwd, state, "stuck")
             append_log(cwd, {"event": "pause", "reason": "stuck", "iteration": iteration, "archive": str(archive)})
@@ -1089,12 +1112,14 @@ def main(argv: list[str]) -> int:
             render_dashboard(cwd, state)
             print(f"⏸️ Paused after {stagnant} no-progress isolated iteration(s); archived state at {archive}")
             print(f"   stuck cause: signals={reason_signals}", flush=True)
+            notify("Wiggum paused", f"stuck after iteration {iteration} ({stuck_reason or 'no_progress'})", args.notify)
             return 0
 
     archive = archive_state(cwd, state, "max-iterations")
     append_log(cwd, {"event": "stop", "reason": "max_iterations", "iteration": iteration, "archive": str(archive)})
     render_dashboard(cwd, state)
     print(f"🛑 Max iterations ({args.max_iterations}) reached; archived state at {archive}")
+    notify("Wiggum stopped", f"max iterations ({args.max_iterations}) reached", args.notify)
     return 0
 
 
