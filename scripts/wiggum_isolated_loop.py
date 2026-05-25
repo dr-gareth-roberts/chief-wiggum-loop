@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
-import datetime as dt
 import hashlib
 import html
 import json
@@ -26,6 +25,19 @@ import tempfile
 import time
 from typing import Any
 
+from wiggum_core import (
+    append_jsonl,
+    archive_state as _archive_state,
+    atomic_write_json,
+    compact_text,
+    git_bytes,
+    is_git_repo,
+    run_git,
+    utc_now,
+    wiggum_pathspec_isolated as wiggum_pathspec,
+    workspace_hash as _workspace_hash,
+)
+
 STATE_REL = Path(".claude/wiggum-isolated.local.json")
 PROMPT_REL = Path(".claude/wiggum-isolated-prompt.local.md")
 LOG_REL = Path(".claude/wiggum-isolated.log.jsonl")
@@ -33,7 +45,6 @@ SUMMARY_REL = Path(".claude/wiggum-isolated-summary.local.md")
 DASHBOARD_MD_REL = Path(".claude/wiggum-dashboard.md")
 DASHBOARD_HTML_REL = Path(".claude/wiggum-dashboard.html")
 CHECKPOINT_REL = Path(".claude/wiggum-checkpoint.local.md")
-ARCHIVE_DIR_REL = Path(".claude/wiggum-archive")
 PROJECT_LESSONS_REL = Path(".claude/wiggum-lessons.jsonl")
 GLOBAL_LESSONS = Path.home() / ".wiggum" / "lessons.jsonl"
 
@@ -57,42 +68,18 @@ PRESETS: dict[str, dict[str, Any]] = {
 }
 
 
-def utc_now() -> str:
-    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def compact_text(text: str, max_chars: int) -> str:
-    text = re.sub(r"\n{3,}", "\n\n", text.strip())
-    if len(text) <= max_chars:
-        return text
-    half = max_chars // 2
-    return text[:half].rstrip() + "\n\n... [middle trimmed] ...\n\n" + text[-half:].lstrip()
-
-
 def extract_tagged(body: str, tag: str) -> str | None:
     match = re.search(rf"<{tag}>(.*?)</{tag}>", body, flags=re.DOTALL)
     return re.sub(r"\s+", " ", match.group(1).strip()) if match else None
 
 
-def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
-
-
-def append_jsonl(path: Path, entry: dict[str, Any]) -> Exception | None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, sort_keys=True) + "\n")
-    except (PermissionError, OSError) as exc:
-        return exc
-    return None
-
-
 def append_log(cwd: Path, entry: dict[str, Any]) -> None:
     append_jsonl(cwd / LOG_REL, {"timestamp": utc_now(), **entry})
+
+
+def archive_state(cwd: Path, state: dict[str, Any], reason: str) -> Path | None:
+    # Bind the isolated-loop's archive prefix + state path for the shared helper.
+    return _archive_state(cwd, state, reason, prefix="wiggum-isolated", state_path=cwd / STATE_REL)
 
 
 _GLOBAL_LESSONS_WARNED = False
@@ -124,19 +111,6 @@ def notify(title: str, message: str, enabled: bool) -> None:
         pass
 
 
-def archive_state(cwd: Path, state: dict[str, Any], reason: str) -> Path | None:
-    state_path = cwd / STATE_REL
-    if not state_path.exists():
-        return None
-    archive_dir = cwd / ARCHIVE_DIR_REL
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    stamp = utc_now().replace(":", "").replace("-", "")
-    archive_path = archive_dir / f"wiggum-isolated.{reason}.{stamp}.json"
-    atomic_write_json(state_path, {**state, "active": False, "stop_reason": reason, "stopped_at": utc_now()})
-    shutil.move(str(state_path), str(archive_path))
-    return archive_path
-
-
 def run_shell(command: str, cwd: Path, timeout: int, stdin_text: str | None = None) -> dict[str, Any]:
     started = time.monotonic()
     try:
@@ -158,60 +132,8 @@ def run_shell(command: str, cwd: Path, timeout: int, stdin_text: str | None = No
         return {"exit_code": 124, "output": output, "timeout": True, "duration_seconds": time.monotonic() - started}
 
 
-def run_git(cwd: Path, args: list[str], timeout: int = 8) -> dict[str, Any]:
-    try:
-        result = subprocess.run(
-            ["git", *args],
-            cwd=str(cwd),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
-        )
-        return {"exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
-    except Exception as exc:
-        return {"exit_code": 1, "stdout": b"", "stderr": str(exc).encode()}
-
-
-def git_bytes(cwd: Path, args: list[str], timeout: int = 8) -> bytes:
-    return bytes(run_git(cwd, args, timeout).get("stdout") or b"")
-
-
-def is_git_repo(cwd: Path) -> bool:
-    return (cwd / ".git").exists() and run_git(cwd, ["rev-parse", "--is-inside-work-tree"]).get("exit_code") == 0
-
-
 def has_head(cwd: Path) -> bool:
     return run_git(cwd, ["rev-parse", "--verify", "HEAD"]).get("exit_code") == 0
-
-
-def wiggum_pathspec() -> list[str]:
-    # Treat .claude as loop/control metadata, not user progress. This prevents
-    # prompt logs, summaries, dashboards, and hook state from defeating stuck detection.
-    return ["--", ".", ":(exclude).claude", ":(exclude).claude/**"]
-
-
-def workspace_hash(cwd: Path) -> str:
-    digest = hashlib.sha256()
-    if is_git_repo(cwd):
-        pathspec = wiggum_pathspec()
-        for args in (
-            ["status", "--porcelain=v1", "-z", *pathspec],
-            ["diff", "--binary", *pathspec],
-            ["diff", "--cached", "--binary", *pathspec],
-        ):
-            digest.update(b"\0".join(arg.encode() for arg in args) + b"\0")
-            digest.update(git_bytes(cwd, args))
-        return digest.hexdigest()
-
-    ignored_dirs = {".git", ".claude", "node_modules", "__pycache__"}
-    for path in sorted(p for p in cwd.rglob("*") if p.is_file() and not (set(p.relative_to(cwd).parts) & ignored_dirs)):
-        digest.update(str(path.relative_to(cwd)).encode() + b"\0")
-        try:
-            digest.update(path.read_bytes())
-        except OSError:
-            pass
-    return digest.hexdigest()
 
 
 def git_status_lines(cwd: Path, limit: int = 80) -> list[str]:
@@ -931,7 +853,7 @@ def main(argv: list[str]) -> int:
         "review_command": args.review_command,
         "prompt_path": str(PROMPT_REL),
         "summary_path": str(SUMMARY_REL),
-        "last_workspace_hash": workspace_hash(cwd),
+        "last_workspace_hash": _workspace_hash(cwd, wiggum_pathspec),
         "last_failure_hash": "",
         "stagnant_iterations": 0,
         "agent_runs": 0,
@@ -979,7 +901,7 @@ def main(argv: list[str]) -> int:
                 notify("Wiggum done", f"verifier already passes at iteration {iteration}", args.notify)
                 return 0
 
-        baseline_hash = workspace_hash(cwd)
+        baseline_hash = _workspace_hash(cwd, wiggum_pathspec)
         candidate_indexes = list(range(1, args.candidates + 1))
         candidates: list[dict[str, Any]] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.candidate_concurrency, args.candidates)) as ex:
@@ -1000,7 +922,7 @@ def main(argv: list[str]) -> int:
                 best["apply_failed"] = True
         cleanup_candidates(cwd, candidates)
 
-        current_hash = workspace_hash(cwd)
+        current_hash = _workspace_hash(cwd, wiggum_pathspec)
         stagnant = int(state.get("stagnant_iterations") or 0)
         stagnant = stagnant + 1 if current_hash == baseline_hash else 0
         verifier_tail = str(best.get("verifier_output_tail") or "")
