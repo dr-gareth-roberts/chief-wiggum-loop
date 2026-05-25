@@ -211,8 +211,11 @@ def git_diff_stat(cwd: Path) -> str:
     return (raw + staged).decode("utf-8", errors="replace").strip()
 
 
-def mark_untracked_for_diff(cwd: Path) -> None:
-    if not is_git_repo(cwd):
+def mark_untracked_for_diff(cwd: Path, allow_in_main: bool = False) -> None:
+    # Refuse to mutate the user's main tree index unless the caller is
+    # explicitly working inside a candidate sandbox. Touching the main
+    # index from a no-op verification pass is a real-world hazard.
+    if not is_git_repo(cwd) or not allow_in_main:
         return
     raw = git_bytes(cwd, ["ls-files", "--others", "--exclude-standard", "-z"])
     paths = [p for p in raw.split(b"\0") if p and not p.startswith(b".claude/wiggum-")]
@@ -223,10 +226,10 @@ def mark_untracked_for_diff(cwd: Path) -> None:
             pass
 
 
-def make_patch(cwd: Path) -> str:
+def make_patch(cwd: Path, allow_in_main: bool = False) -> str:
     if not is_git_repo(cwd):
         return ""
-    mark_untracked_for_diff(cwd)
+    mark_untracked_for_diff(cwd, allow_in_main=allow_in_main)
     return git_bytes(cwd, ["diff", "--binary", *wiggum_pathspec()], timeout=15).decode("utf-8", errors="replace")
 
 
@@ -553,7 +556,11 @@ def run_candidate(cwd: Path, core_prompt: str, args: argparse.Namespace, state: 
     combined_output = (agent.get("output_tail") or "") + "\n" + (str(postcheck.get("output") or "") if postcheck else "")
     metrics = parse_metrics(combined_output)
     metric_value = metrics.get(args.metric_name) if args.metric_name else None
-    patch = make_patch(candidate_cwd) if is_git_repo(candidate_cwd) else ""
+    # Only mark untracked files inside a real candidate sandbox so the
+    # user's main-tree index is never mutated as a side-effect of patch
+    # capture. When sandbox=none, candidate_cwd == cwd (main tree).
+    in_sandbox = candidate_cwd != cwd
+    patch = make_patch(candidate_cwd, allow_in_main=in_sandbox) if is_git_repo(candidate_cwd) else ""
     result = {
         **agent,
         "candidate": candidate_index,
