@@ -36,8 +36,11 @@ Multi-model batch + critic + final reviewer:
   --review-command "claude --print" \
   --success-command "npm test" \
   --max-iterations 24 \
-  --mode variants
+  --mode variants \
+  --explain
 ```
+
+`--explain` attaches the per-round `reason_signals` dict (`regex_hit`, `stagnant`, `verifier_changed`, `agent_timeout`, `metric_missing`) to each iteration entry in `.claude/wiggum-isolated.log.jsonl`, which makes it obvious which signal classified a round as stuck when post-mortem-ing a long multi-model run.
 
 If the agent command needs a prompt-file argument instead of stdin, include `{prompt_file}`:
 
