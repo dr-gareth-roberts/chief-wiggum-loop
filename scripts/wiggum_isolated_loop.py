@@ -771,6 +771,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--human-checkpoint-every", type=int, default=0)
     p.add_argument("--no-global-lessons", action="store_true", help="Do not append to ~/.wiggum/lessons.jsonl")
     p.add_argument("--no-agent-validation", action="store_true", help="Skip the startup probe that runs each --agent-command with stdin to catch missing/broken commands")
+    p.add_argument("--explain", action="store_true", default=False, help="Attach the per-round stuck reason signals to the iteration log entry")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
     preset = PRESETS.get(args.preset, {})
@@ -932,6 +933,14 @@ def main(argv: list[str]) -> int:
         verifier_tail = str(best.get("verifier_output_tail") or "")
         failure_hash = hashlib.sha256(verifier_tail.encode()).hexdigest() if verifier_tail else ""
         stuck_reason = classify_stuck_reason(best, stagnant, state.get("last_failure_hash") or "")
+        output_for_signals = str(best.get("output_tail") or "")
+        reason_signals = {
+            "regex_hit": bool(REFUSAL_REGEX.search(output_for_signals[-800:])),
+            "stagnant": stagnant > 0,
+            "verifier_changed": failure_hash != state.get("last_failure_hash", ""),
+            "agent_timeout": best.get("agent_timeout") or best.get("timeout"),
+            "metric_missing": bool(best.get("metric_required") and best.get("metric_value") is None),
+        }
         metric_value = best.get("metric_value")
         if args.metric_name and metric_improved(metric_value, state.get("best_metric"), args.metric_direction):
             state["best_metric"] = metric_value
@@ -968,6 +977,8 @@ def main(argv: list[str]) -> int:
                 for c in candidates
             ],
         }
+        if args.explain:
+            round_info["reason_signals"] = reason_signals
         updated_summary = update_memory_summary(cwd, args, round_info) if args.mode != "exact" else ""
         state["last_summary_chars"] = len(updated_summary)
         append_log(cwd, round_info)
@@ -1016,12 +1027,14 @@ def main(argv: list[str]) -> int:
             if maybe_pause_for_human(cwd, args, state, "stuck"):
                 archive = archive_state(cwd, state, "human-checkpoint")
                 print(f"⏸️ Human checkpoint written for stuck loop; archived state at {archive}")
+                print(f"   stuck cause: signals={reason_signals}", flush=True)
                 return 0
             archive = archive_state(cwd, state, "stuck")
             append_log(cwd, {"event": "pause", "reason": "stuck", "iteration": iteration, "archive": str(archive)})
             append_lesson(cwd, {"event": "stuck_pause", "iteration": iteration, "stuck_reason": stuck_reason}, not args.no_global_lessons)
             render_dashboard(cwd, state)
             print(f"⏸️ Paused after {stagnant} no-progress isolated iteration(s); archived state at {archive}")
+            print(f"   stuck cause: signals={reason_signals}", flush=True)
             return 0
 
     archive = archive_state(cwd, state, "max-iterations")
