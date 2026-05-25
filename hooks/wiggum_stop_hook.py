@@ -8,21 +8,30 @@ verifier command, pause on no filesystem progress, and maintain a JSONL ledger.
 
 from __future__ import annotations
 
-import datetime as _dt
-import hashlib
 import json
 import os
-from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
+
+# Make the sibling ``scripts/`` directory importable so we can share helpers
+# with ``wiggum_isolated_loop.py`` instead of duplicating them here.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+from wiggum_core import (  # noqa: E402  (sys.path manipulation must come first)
+    append_jsonl,
+    archive_state as _archive_state,
+    atomic_write_json,
+    utc_now,
+    wiggum_pathspec_stop_hook,
+    workspace_hash as _workspace_hash,
+)
 
 STATE_REL = Path(".claude/wiggum-loop.local.json")
 PROMPT_REL = Path(".claude/wiggum-prompt.local.md")
 LOG_REL = Path(".claude/wiggum-loop.log.jsonl")
-ARCHIVE_DIR_REL = Path(".claude/wiggum-archive")
 
 DEFAULT_VARIANTS = [
     "Make the smallest concrete improvement that moves the task toward done, then verify it.",
@@ -38,40 +47,20 @@ def debug(message: str) -> None:
         print(f"[wiggum-debug] {message}", file=sys.stderr, flush=True)
 
 
-def utc_now() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
-
-
 def append_log(cwd: Path, entry: dict[str, Any]) -> None:
-    log_path = cwd / LOG_REL
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    entry = {"timestamp": utc_now(), **entry}
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, sort_keys=True) + "\n")
+    append_jsonl(cwd / LOG_REL, {"timestamp": utc_now(), **entry})
 
 
 def archive_state(cwd: Path, state_path: Path, state: dict[str, Any], reason: str) -> Path | None:
-    if not state_path.exists():
-        return None
-    archive_dir = cwd / ARCHIVE_DIR_REL
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    stamp = utc_now().replace(":", "").replace("-", "")
-    archive_path = archive_dir / f"wiggum-loop.{reason}.{stamp}.json"
-    state = {**state, "active": False, "stopped_at": utc_now(), "stop_reason": reason}
-    atomic_write_json(state_path, state)
-    shutil.move(str(state_path), str(archive_path))
-    return archive_path
+    # Bind the stop-hook's archive prefix for the shared helper. The signature
+    # accepts ``state_path`` explicitly because different callers in this file
+    # already had ``state_path`` in scope; passing it through preserves their
+    # call sites unchanged.
+    return _archive_state(cwd, state, reason, prefix="wiggum-loop", state_path=state_path)
 
 
 def parse_hook_input() -> dict[str, Any]:
@@ -147,48 +136,6 @@ def run_command(command: str, cwd: Path, timeout_seconds: int) -> dict[str, Any]
     except subprocess.TimeoutExpired as exc:
         output = ((exc.stdout or "") + (exc.stderr or ""))[-4000:]
         return {"configured": True, "exit_code": 124, "output_tail": output, "timeout": True}
-
-
-def run_git_bytes(cwd: Path, args: list[str], timeout: int = 5) -> bytes:
-    try:
-        result = subprocess.run(
-            ["git", *args],
-            cwd=str(cwd),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout,
-            check=False,
-        )
-        return result.stdout
-    except Exception:
-        return b""
-
-
-def workspace_hash(cwd: Path) -> str:
-    digest = hashlib.sha256()
-    if (cwd / ".git").exists():
-        # Exclude Wiggum's own state/ledger files; otherwise the loop's bookkeeping
-        # would look like user progress and no-progress detection would never fire.
-        pathspec = ["--", ".", ":(exclude).claude/wiggum-*", ":(exclude).claude/wiggum-archive/*"]
-        for args in (
-            ["status", "--porcelain=v1", "-z", *pathspec],
-            ["diff", "--binary", *pathspec],
-            ["diff", "--cached", "--binary", *pathspec],
-        ):
-            digest.update(b"\0".join(arg.encode() for arg in args))
-            digest.update(b"\0")
-            digest.update(run_git_bytes(cwd, list(args)))
-        return digest.hexdigest()
-
-    ignored_dirs = {".git", ".claude", "node_modules", "__pycache__"}
-    for path in sorted(p for p in cwd.rglob("*") if p.is_file() and not (set(p.relative_to(cwd).parts) & ignored_dirs)):
-        rel = str(path.relative_to(cwd)).encode()
-        digest.update(rel + b"\0")
-        try:
-            digest.update(path.read_bytes())
-        except OSError:
-            pass
-    return digest.hexdigest()
 
 
 def select_variant(state: dict[str, Any], next_iteration: int, stagnant_iterations: int) -> str:
@@ -317,7 +264,7 @@ def main() -> int:
         return 0
 
     debug("computing workspace hash")
-    current_hash = workspace_hash(cwd)
+    current_hash = _workspace_hash(cwd, wiggum_pathspec_stop_hook)
     debug("workspace hash computed")
     previous_hash = str(state.get("last_workspace_hash") or "")
     stagnant_iterations = int(state.get("stagnant_iterations") or 0)
