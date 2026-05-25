@@ -450,27 +450,46 @@ def build_meta_review_prompt(kind: str, core_prompt: str, args: argparse.Namespa
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
-def run_agent(command: str, prompt: str, cwd: Path, timeout: int, iteration: int) -> dict[str, Any]:
-    started = time.monotonic()
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".md", delete=False) as f:
-        f.write(prompt)
-        prompt_file = f.name
-    try:
-        rendered = command.replace("{prompt_file}", shlex.quote(prompt_file)).replace("{iteration}", str(iteration))
-        result = run_shell(rendered, cwd, timeout, None if "{prompt_file}" in command else prompt)
-    finally:
+def run_agent(command: str, prompt: str, cwd: Path, timeout: int, iteration: int, retries: int = 1) -> dict[str, Any]:
+    def _single_attempt() -> dict[str, Any]:
+        started = time.monotonic()
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".md", delete=False) as f:
+            f.write(prompt)
+            prompt_file = f.name
         try:
-            os.unlink(prompt_file)
-        except OSError:
-            pass
-    output = str(result.get("output") or "")
-    return {
-        "exit_code": result.get("exit_code"),
-        "timeout": result.get("timeout", False),
-        "duration_seconds": time.monotonic() - started,
-        "output_tail": output[-4000:],
-        "estimated_tokens": max(1, (len(prompt) + len(output)) // 4),
-    }
+            rendered = command.replace("{prompt_file}", shlex.quote(prompt_file)).replace("{iteration}", str(iteration))
+            result = run_shell(rendered, cwd, timeout, None if "{prompt_file}" in command else prompt)
+        finally:
+            try:
+                os.unlink(prompt_file)
+            except OSError:
+                pass
+        output = str(result.get("output") or "")
+        return {
+            "exit_code": result.get("exit_code"),
+            "timeout": result.get("timeout", False),
+            "duration_seconds": time.monotonic() - started,
+            "output_tail": output[-4000:],
+            "estimated_tokens": max(1, (len(prompt) + len(output)) // 4),
+        }
+
+    # Retry transient agent failures: very-short non-zero, non-timeout exits
+    # are usually crashes/connection blips, not real refusals. Return the
+    # LAST attempt's result so duration/exit_code reflect what actually ran.
+    attempt = _single_attempt()
+    remaining = max(0, retries)
+    while remaining > 0:
+        exit_code = attempt.get("exit_code")
+        if exit_code in (None, 0):
+            break
+        if attempt.get("timeout"):
+            break
+        if float(attempt.get("duration_seconds") or 0) >= 5:
+            break
+        time.sleep(2)
+        attempt = _single_attempt()
+        remaining -= 1
+    return attempt
 
 
 def classify_stuck_reason(candidate: dict[str, Any], stagnant: int, previous_failure_hash: str | None) -> str:
@@ -560,7 +579,7 @@ def run_candidate(cwd: Path, core_prompt: str, args: argparse.Namespace, state: 
     memory_summary = "" if args.mode == "exact" else read_summary(cwd, args.summary_max_chars)
     prompt = build_iteration_prompt(core_prompt, args, iteration, int(state.get("stagnant_iterations") or 0), last_agent, memory_summary, mutation_hint)
     agent_command, agent_command_index = select_agent_command(args, iteration, candidate_index)
-    agent = run_agent(agent_command, prompt, candidate_cwd, args.agent_timeout, iteration)
+    agent = run_agent(agent_command, prompt, candidate_cwd, args.agent_timeout, iteration, retries=args.agent_retries)
     postcheck = run_shell(args.success_command, candidate_cwd, args.success_timeout) if args.success_command else None
     combined_output = (agent.get("output_tail") or "") + "\n" + (str(postcheck.get("output") or "") if postcheck else "")
     metrics = parse_metrics(combined_output, args.metric_name)
@@ -640,7 +659,7 @@ def run_critic_if_due(cwd: Path, core_prompt: str, args: argparse.Namespace, sta
     if not args.critic_command or not args.critic_every or iteration % args.critic_every != 0:
         return None
     prompt = build_meta_review_prompt("critic", core_prompt, args, state)
-    critic = run_agent(args.critic_command, prompt, cwd, args.critic_timeout, iteration)
+    critic = run_agent(args.critic_command, prompt, cwd, args.critic_timeout, iteration, retries=args.agent_retries)
     body = str(critic.get("output_tail") or "").strip()
     if body:
         append_section_to_summary(cwd, f"Critic review after iteration {iteration}", body, args.summary_max_chars)
@@ -652,7 +671,7 @@ def final_review_allows_exit(cwd: Path, core_prompt: str, args: argparse.Namespa
     if not args.review_command:
         return True, None
     prompt = build_meta_review_prompt("final_reviewer", core_prompt, args, state, reason)
-    review = run_agent(args.review_command, prompt, cwd, args.review_timeout, int(state.get("iteration") or 0))
+    review = run_agent(args.review_command, prompt, cwd, args.review_timeout, int(state.get("iteration") or 0), retries=args.agent_retries)
     body = str(review.get("output_tail") or "").strip()
     if body:
         append_section_to_summary(cwd, f"Final review for {reason}", body, args.summary_max_chars)
@@ -734,6 +753,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--agent-command", action="append", default=None, help="Fresh worker command. Repeat for multi-model rotation. Prompt is stdin unless {prompt_file} is used.")
     p.add_argument("--agent-switch-every", type=int, default=4, help="Switch worker command every N iterations")
     p.add_argument("--agent-timeout", type=int, default=600, help="Timeout per isolated agent run in seconds")
+    p.add_argument("--agent-retries", type=int, default=1, help="Retry an agent invocation up to N times when it exits non-zero in under 5s (transient crash/blip protection)")
     p.add_argument("--max-iterations", type=int, default=12, help="Maximum iterations; 0 means unbounded")
     p.add_argument("--allow-infinite", action="store_true", help="Alias for --max-iterations 0")
     p.add_argument("--completion-promise", default=None, help="Stop when output contains exact <promise>TEXT</promise>")
@@ -806,6 +826,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             args.max_agent_runs >= 0,
             args.max_estimated_tokens >= 0,
             args.human_checkpoint_every >= 0,
+            args.agent_retries >= 0,
         ]
     )
     if not numeric_ok:
