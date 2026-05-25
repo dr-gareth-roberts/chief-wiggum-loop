@@ -583,7 +583,7 @@ def candidate_rank(candidate: dict[str, Any], args: argparse.Namespace, best_met
 def candidate_accepted(candidate: dict[str, Any], args: argparse.Namespace, state: dict[str, Any], baseline_hash: str) -> bool:
     policy = args.acceptance
     if policy == "auto":
-        policy = "metric" if args.metric_name else "verifier" if args.success_command and (args.sandbox != "none" or args.candidates > 1) else "always"
+        policy = "metric" if args.metric_name else ("verifier" if args.success_command else "always")
     if policy == "always":
         return True
     if policy == "verifier":
