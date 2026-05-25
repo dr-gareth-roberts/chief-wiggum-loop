@@ -4,6 +4,15 @@ Wiggum Loop is a safer, progress-aware variation on Anthropic's Ralph Loop plugi
 
 The original Ralph loop repeats the same prompt from a `Stop` hook inside the same Claude Code session. That is useful for short loops, but long runs accumulate chat history; eventually the model can drift, repeat itself, or give up. Wiggum keeps the Stop-hook option, but adds a **true isolated runner** that starts a fresh agent process for every iteration and carries only bounded file/ledger memory forward.
 
+## What's new in 0.2.0
+
+Two breaking-default changes you should know about before upgrading:
+
+- **Global lessons are now opt-in.** By default the isolated runner writes only to `.claude/wiggum-lessons.jsonl` inside the current project. Pass `--global-lessons` to also append to `~/.wiggum/lessons.jsonl`. The previous `--no-global-lessons` flag still works but is deprecated; it is no longer needed for the common case.
+- **`--sandbox` auto-upgrades to `worktree` in git repos.** When the current directory is a git repo with a valid `HEAD`, omitting `--sandbox` now selects `worktree` instead of `none`. Outside a git repo the default remains `none`. Pass `--sandbox none` explicitly if you want the worker to edit the main tree.
+
+See `CHANGELOG.md` for the full list of fixes and new flags (`--explain`, `--agent-retries`, `--no-agent-validation`, `--global-lessons`).
+
 ## Two operating modes
 
 ### 1. Stop-hook loop: `/wiggum-loop`
@@ -117,7 +126,7 @@ The isolated runner stores:
 - rolling summary: `.claude/wiggum-isolated-summary.local.md`
 - ledger: `.claude/wiggum-isolated.log.jsonl`
 - dashboard: `.claude/wiggum-dashboard.md` and `.claude/wiggum-dashboard.html`
-- lessons: `.claude/wiggum-lessons.jsonl` and `~/.wiggum/lessons.jsonl`
+- lessons: `.claude/wiggum-lessons.jsonl` (always) and `~/.wiggum/lessons.jsonl` (only with `--global-lessons`)
 - archives: `.claude/wiggum-archive/`
 
 ## Isolated runner options
@@ -139,6 +148,16 @@ If a command needs a prompt file instead of stdin, use `{prompt_file}`:
 ```
 
 `{iteration}` is also replaced when present.
+
+### Startup validation and transient-failure retries
+
+```bash
+--no-agent-validation
+--agent-retries 1
+```
+
+- `--no-agent-validation`: by default the runner probes each `--agent-command` once at startup with a tiny stdin payload so a typo or missing binary fails fast. Pass `--no-agent-validation` to skip the probe (useful when the agent has expensive cold-start costs or refuses empty input).
+- `--agent-retries N` (default `1`): if an agent invocation exits non-zero in under 5 seconds, the runner retries it up to `N` times. This rides over transient rate-limit and network blips without giving up on a worker. Long-running failures are never retried.
 
 ### Critic and final reviewer
 
@@ -191,7 +210,7 @@ Only the best accepted patch is applied to the main tree.
 --acceptance auto|always|verifier|metric|progress
 ```
 
-- `auto`: metric if metric is configured; verifier if sandboxed with verifier; otherwise always.
+- `auto`: metric if metric is configured; verifier whenever `--success-command` is set (regardless of sandbox or candidate count); otherwise always.
 - `always`: keep the chosen candidate regardless of checks.
 - `verifier`: keep only if `--success-command` exits 0.
 - `metric`: keep only if configured metric improves.
@@ -251,6 +270,8 @@ The runner classifies failures as:
 - `metric_missing`
 - `patch_rejected_by_policy`
 
+The classifier checks stagnation signals (no workspace change, repeated verifier failure, missing metric) before the refusal regex, so subprocess errors that happen to mention phrases like "cannot find" are no longer misread as model give-up.
+
 Prompt mutation controls:
 
 ```bash
@@ -259,6 +280,14 @@ Prompt mutation controls:
 ```
 
 The deterministic mutation adds a tactical anti-repeat hint based on the stuck reason. Command mode sends JSON to `--mutation-command` and uses the output as the next tactical hint.
+
+#### Explaining why a round was classified as stuck
+
+```bash
+--explain
+```
+
+By default the runner already prints `stuck cause: signals={...}` alongside the `⏸️ Paused...` line whenever it pauses, so you can see which signal tripped the classifier without rerunning. With `--explain`, the same `reason_signals` dict (keys: `regex_hit`, `stagnant`, `verifier_changed`, `agent_timeout`, `metric_missing`) is also attached to every iteration entry in `.claude/wiggum-isolated.log.jsonl`, making post-mortem analysis straightforward.
 
 ### Presets
 
@@ -311,18 +340,21 @@ Every iteration updates:
 .claude/wiggum-dashboard.html
 ```
 
-Failure/stuck lessons are appended to:
+Failure/stuck lessons are always appended to the project file:
 
 ```text
 .claude/wiggum-lessons.jsonl
-~/.wiggum/lessons.jsonl
 ```
 
-Disable global lessons:
+Lessons are project-only by default. To also append them to your shared global file `~/.wiggum/lessons.jsonl`, opt in:
 
 ```bash
---no-global-lessons
+--global-lessons
 ```
+
+If `~/.wiggum/` is read-only (for example, when Wiggum runs inside another sandboxed agent), the global append is skipped silently and a `global_lessons_disabled` event is recorded once in the ledger.
+
+`--no-global-lessons` is a deprecated alias kept for backwards compatibility; with the new opt-in default it is no longer needed in the common case.
 
 ## Recommended full pattern
 
@@ -336,7 +368,6 @@ Disable global lessons:
   --critic-every 4 \
   --review-command "claude --print" \
   --success-command "npm test" \
-  --sandbox worktree \
   --candidates 2 \
   --candidate-concurrency 2 \
   --acceptance verifier \
@@ -345,6 +376,8 @@ Disable global lessons:
   --human-checkpoint on-stuck \
   --mode variants
 ```
+
+In a git repo, `--sandbox worktree` is now the default and does not need to be passed explicitly. Lessons stay project-only by default, so `--no-global-lessons` is no longer required either — add `--global-lessons` if you want the shared `~/.wiggum/lessons.jsonl` history back.
 
 ## Installation
 
@@ -372,7 +405,7 @@ Claude Code plugin discovery varies by version. If local plugin discovery does n
 
 Hooks and agent commands run locally with your credentials.
 
-Review commands before using them:
+Every `--*-command` flag is passed to Python's `subprocess.run(..., shell=True)` under your user account, in your current working directory, with the full environment. That means shell metacharacters (`|`, `>`, `;`, `$(...)`, backticks) are interpreted; values are not sanitized. Treat each of these flags as equivalent to pasting the string into your terminal:
 
 - `--agent-command`
 - `--success-command`
@@ -381,7 +414,7 @@ Review commands before using them:
 - `--review-command`
 - `--mutation-command`
 
-Prefer sandboxed mode for unattended code-writing loops.
+Prefer sandboxed mode (the new default in git repos) for unattended code-writing loops so candidate patches can be reviewed before they touch the main tree.
 
 ## Tests
 
