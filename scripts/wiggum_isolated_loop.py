@@ -66,6 +66,11 @@ def compact_text(text: str, max_chars: int) -> str:
     return text[:half].rstrip() + "\n\n... [middle trimmed] ...\n\n" + text[-half:].lstrip()
 
 
+def extract_tagged(body: str, tag: str) -> str | None:
+    match = re.search(rf"<{tag}>(.*?)</{tag}>", body, flags=re.DOTALL)
+    return re.sub(r"\s+", " ", match.group(1).strip()) if match else None
+
+
 def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
@@ -73,21 +78,32 @@ def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def append_jsonl(path: Path, entry: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, sort_keys=True) + "\n")
+def append_jsonl(path: Path, entry: dict[str, Any]) -> Exception | None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, sort_keys=True) + "\n")
+    except (PermissionError, OSError) as exc:
+        return exc
+    return None
 
 
 def append_log(cwd: Path, entry: dict[str, Any]) -> None:
     append_jsonl(cwd / LOG_REL, {"timestamp": utc_now(), **entry})
 
 
+_GLOBAL_LESSONS_WARNED = False
+
+
 def append_lesson(cwd: Path, lesson: dict[str, Any], global_enabled: bool = True) -> None:
+    global _GLOBAL_LESSONS_WARNED
     entry = {"timestamp": utc_now(), "cwd": str(cwd), **lesson}
     append_jsonl(cwd / PROJECT_LESSONS_REL, entry)
     if global_enabled:
-        append_jsonl(GLOBAL_LESSONS, entry)
+        exc = append_jsonl(GLOBAL_LESSONS, entry)
+        if exc is not None and not _GLOBAL_LESSONS_WARNED:
+            _GLOBAL_LESSONS_WARNED = True
+            append_log(cwd, {"event": "global_lessons_disabled", "reason": str(exc)})
 
 
 def archive_state(cwd: Path, state: dict[str, Any], reason: str) -> Path | None:
@@ -195,8 +211,11 @@ def git_diff_stat(cwd: Path) -> str:
     return (raw + staged).decode("utf-8", errors="replace").strip()
 
 
-def mark_untracked_for_diff(cwd: Path) -> None:
-    if not is_git_repo(cwd):
+def mark_untracked_for_diff(cwd: Path, allow_in_main: bool = False) -> None:
+    # Refuse to mutate the user's main tree index unless the caller is
+    # explicitly working inside a candidate sandbox. Touching the main
+    # index from a no-op verification pass is a real-world hazard.
+    if not is_git_repo(cwd) or not allow_in_main:
         return
     raw = git_bytes(cwd, ["ls-files", "--others", "--exclude-standard", "-z"])
     paths = [p for p in raw.split(b"\0") if p and not p.startswith(b".claude/wiggum-")]
@@ -207,10 +226,10 @@ def mark_untracked_for_diff(cwd: Path) -> None:
             pass
 
 
-def make_patch(cwd: Path) -> str:
+def make_patch(cwd: Path, allow_in_main: bool = False) -> str:
     if not is_git_repo(cwd):
         return ""
-    mark_untracked_for_diff(cwd)
+    mark_untracked_for_diff(cwd, allow_in_main=allow_in_main)
     return git_bytes(cwd, ["diff", "--binary", *wiggum_pathspec()], timeout=15).decode("utf-8", errors="replace")
 
 
@@ -258,21 +277,30 @@ def cleanup_candidate_workspace(cwd: Path, candidate_cwd: Path, kind: str, tmp_r
         shutil.rmtree(tmp_root, ignore_errors=True)
 
 
-def parse_metrics(text: str) -> dict[str, float]:
+def parse_metrics(text: str, metric_name: str = "") -> dict[str, float]:
+    # The METRIC-prefixed form always parses; the bare 'name=value' form
+    # is only honored when it matches the explicit metric_name the caller
+    # is tracking, so unrelated 'foo=bar' lines in agent output don't get
+    # mistakenly promoted to metrics.
+    prefixed = r"^\s*METRIC\s+([A-Za-z0-9_.:-]+)\s*=\s*(-?\d+(?:\.\d+)?)\s*$"
+    bare = r"^\s*([A-Za-z0-9_.:-]+)\s*=\s*(-?\d+(?:\.\d+)?)\s*$"
     metrics: dict[str, float] = {}
-    patterns = [
-        r"^\s*METRIC\s+([A-Za-z0-9_.:-]+)\s*=\s*(-?\d+(?:\.\d+)?)\s*$",
-        r"^\s*([A-Za-z0-9_.:-]+)\s*=\s*(-?\d+(?:\.\d+)?)\s*$",
-    ]
     for line in text.splitlines():
-        for pattern in patterns:
-            m = re.match(pattern, line)
-            if m:
-                try:
-                    metrics[m.group(1)] = float(m.group(2))
-                except ValueError:
-                    pass
-                break
+        m = re.match(prefixed, line)
+        if m:
+            try:
+                metrics[m.group(1)] = float(m.group(2))
+            except ValueError:
+                pass
+            continue
+        if not metric_name:
+            continue
+        m = re.match(bare, line)
+        if m and m.group(1) == metric_name:
+            try:
+                metrics[m.group(1)] = float(m.group(2))
+            except ValueError:
+                pass
     return metrics
 
 
@@ -287,11 +315,8 @@ def metric_improved(new: float | None, best: float | None, direction: str) -> bo
 def promise_was_met(output: str, expected: str | None) -> bool:
     if not expected:
         return False
-    match = re.search(r"<promise>(.*?)</promise>", output, flags=re.DOTALL)
-    if not match:
-        return False
-    actual = re.sub(r"\s+", " ", match.group(1).strip())
-    return actual == expected
+    actual = extract_tagged(output, "promise")
+    return actual is not None and actual == expected
 
 
 def read_prompt(args: argparse.Namespace) -> str:
@@ -425,27 +450,46 @@ def build_meta_review_prompt(kind: str, core_prompt: str, args: argparse.Namespa
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
-def run_agent(command: str, prompt: str, cwd: Path, timeout: int, iteration: int) -> dict[str, Any]:
-    started = time.monotonic()
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".md", delete=False) as f:
-        f.write(prompt)
-        prompt_file = f.name
-    try:
-        rendered = command.replace("{prompt_file}", shlex.quote(prompt_file)).replace("{iteration}", str(iteration))
-        result = run_shell(rendered, cwd, timeout, None if "{prompt_file}" in command else prompt)
-    finally:
+def run_agent(command: str, prompt: str, cwd: Path, timeout: int, iteration: int, retries: int = 1) -> dict[str, Any]:
+    def _single_attempt() -> dict[str, Any]:
+        started = time.monotonic()
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".md", delete=False) as f:
+            f.write(prompt)
+            prompt_file = f.name
         try:
-            os.unlink(prompt_file)
-        except OSError:
-            pass
-    output = str(result.get("output") or "")
-    return {
-        "exit_code": result.get("exit_code"),
-        "timeout": result.get("timeout", False),
-        "duration_seconds": time.monotonic() - started,
-        "output_tail": output[-4000:],
-        "estimated_tokens": max(1, (len(prompt) + len(output)) // 4),
-    }
+            rendered = command.replace("{prompt_file}", shlex.quote(prompt_file)).replace("{iteration}", str(iteration))
+            result = run_shell(rendered, cwd, timeout, None if "{prompt_file}" in command else prompt)
+        finally:
+            try:
+                os.unlink(prompt_file)
+            except OSError:
+                pass
+        output = str(result.get("output") or "")
+        return {
+            "exit_code": result.get("exit_code"),
+            "timeout": result.get("timeout", False),
+            "duration_seconds": time.monotonic() - started,
+            "output_tail": output[-4000:],
+            "estimated_tokens": max(1, (len(prompt) + len(output)) // 4),
+        }
+
+    # Retry transient agent failures: very-short non-zero, non-timeout exits
+    # are usually crashes/connection blips, not real refusals. Return the
+    # LAST attempt's result so duration/exit_code reflect what actually ran.
+    attempt = _single_attempt()
+    remaining = max(0, retries)
+    while remaining > 0:
+        exit_code = attempt.get("exit_code")
+        if exit_code in (None, 0):
+            break
+        if attempt.get("timeout"):
+            break
+        if float(attempt.get("duration_seconds") or 0) >= 5:
+            break
+        time.sleep(2)
+        attempt = _single_attempt()
+        remaining -= 1
+    return attempt
 
 
 def classify_stuck_reason(candidate: dict[str, Any], stagnant: int, previous_failure_hash: str | None) -> str:
@@ -535,12 +579,16 @@ def run_candidate(cwd: Path, core_prompt: str, args: argparse.Namespace, state: 
     memory_summary = "" if args.mode == "exact" else read_summary(cwd, args.summary_max_chars)
     prompt = build_iteration_prompt(core_prompt, args, iteration, int(state.get("stagnant_iterations") or 0), last_agent, memory_summary, mutation_hint)
     agent_command, agent_command_index = select_agent_command(args, iteration, candidate_index)
-    agent = run_agent(agent_command, prompt, candidate_cwd, args.agent_timeout, iteration)
+    agent = run_agent(agent_command, prompt, candidate_cwd, args.agent_timeout, iteration, retries=args.agent_retries)
     postcheck = run_shell(args.success_command, candidate_cwd, args.success_timeout) if args.success_command else None
     combined_output = (agent.get("output_tail") or "") + "\n" + (str(postcheck.get("output") or "") if postcheck else "")
-    metrics = parse_metrics(combined_output)
+    metrics = parse_metrics(combined_output, args.metric_name)
     metric_value = metrics.get(args.metric_name) if args.metric_name else None
-    patch = make_patch(candidate_cwd) if is_git_repo(candidate_cwd) else ""
+    # Only mark untracked files inside a real candidate sandbox so the
+    # user's main-tree index is never mutated as a side-effect of patch
+    # capture. When sandbox=none, candidate_cwd == cwd (main tree).
+    in_sandbox = candidate_cwd != cwd
+    patch = make_patch(candidate_cwd, allow_in_main=in_sandbox) if is_git_repo(candidate_cwd) else ""
     result = {
         **agent,
         "candidate": candidate_index,
@@ -611,7 +659,7 @@ def run_critic_if_due(cwd: Path, core_prompt: str, args: argparse.Namespace, sta
     if not args.critic_command or not args.critic_every or iteration % args.critic_every != 0:
         return None
     prompt = build_meta_review_prompt("critic", core_prompt, args, state)
-    critic = run_agent(args.critic_command, prompt, cwd, args.critic_timeout, iteration)
+    critic = run_agent(args.critic_command, prompt, cwd, args.critic_timeout, iteration, retries=args.agent_retries)
     body = str(critic.get("output_tail") or "").strip()
     if body:
         append_section_to_summary(cwd, f"Critic review after iteration {iteration}", body, args.summary_max_chars)
@@ -623,11 +671,11 @@ def final_review_allows_exit(cwd: Path, core_prompt: str, args: argparse.Namespa
     if not args.review_command:
         return True, None
     prompt = build_meta_review_prompt("final_reviewer", core_prompt, args, state, reason)
-    review = run_agent(args.review_command, prompt, cwd, args.review_timeout, int(state.get("iteration") or 0))
+    review = run_agent(args.review_command, prompt, cwd, args.review_timeout, int(state.get("iteration") or 0), retries=args.agent_retries)
     body = str(review.get("output_tail") or "").strip()
     if body:
         append_section_to_summary(cwd, f"Final review for {reason}", body, args.summary_max_chars)
-    approved = promise_was_met(body.replace("<review>", "<promise>").replace("</review>", "</promise>"), args.review_approval_token)
+    approved = extract_tagged(body, "review") == args.review_approval_token
     append_log(cwd, {"event": "final_review", "reason": reason, "iteration": state.get("iteration"), "approved": approved, "review_exit_code": review.get("exit_code"), "review_timeout": review.get("timeout", False), "output_tail": body})
     return approved, review
 
@@ -705,6 +753,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--agent-command", action="append", default=None, help="Fresh worker command. Repeat for multi-model rotation. Prompt is stdin unless {prompt_file} is used.")
     p.add_argument("--agent-switch-every", type=int, default=4, help="Switch worker command every N iterations")
     p.add_argument("--agent-timeout", type=int, default=600, help="Timeout per isolated agent run in seconds")
+    p.add_argument("--agent-retries", type=int, default=1, help="Retry an agent invocation up to N times when it exits non-zero in under 5s (transient crash/blip protection)")
     p.add_argument("--max-iterations", type=int, default=12, help="Maximum iterations; 0 means unbounded")
     p.add_argument("--allow-infinite", action="store_true", help="Alias for --max-iterations 0")
     p.add_argument("--completion-promise", default=None, help="Stop when output contains exact <promise>TEXT</promise>")
@@ -735,7 +784,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--max-estimated-tokens", type=int, default=0)
     p.add_argument("--human-checkpoint", choices=["never", "always", "on-stuck", "on-critic"], default="never")
     p.add_argument("--human-checkpoint-every", type=int, default=0)
-    p.add_argument("--no-global-lessons", action="store_true", help="Do not append to ~/.wiggum/lessons.jsonl")
+    p.add_argument("--global-lessons", action="store_true", help="Opt in to appending lessons to ~/.wiggum/lessons.jsonl (default: project-only)")
+    p.add_argument("--no-global-lessons", action="store_true", help="Deprecated alias kept for backwards compatibility; global lessons are now opt-in via --global-lessons")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
     preset = PRESETS.get(args.preset, {})
@@ -776,6 +826,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             args.max_agent_runs >= 0,
             args.max_estimated_tokens >= 0,
             args.human_checkpoint_every >= 0,
+            args.agent_retries >= 0,
         ]
     )
     if not numeric_ok:
@@ -786,6 +837,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     cwd = Path.cwd()
+    # Global lessons are now opt-in: --global-lessons turns them on;
+    # the legacy --no-global-lessons flag still suppresses them.
+    global_enabled = bool(args.global_lessons) and not bool(args.no_global_lessons)
     core_prompt = read_prompt(args)
     if not core_prompt:
         print("No prompt provided. Pass prompt text or --prompt-file.", file=sys.stderr)
@@ -925,7 +979,7 @@ def main(argv: list[str]) -> int:
         state["last_summary_chars"] = len(updated_summary)
         append_log(cwd, round_info)
         if stuck_reason:
-            append_lesson(cwd, {"event": "iteration_lesson", "iteration": iteration, "stuck_reason": stuck_reason, "summary": compact_text(best.get("output_tail", ""), 500)}, not args.no_global_lessons)
+            append_lesson(cwd, {"event": "iteration_lesson", "iteration": iteration, "stuck_reason": stuck_reason, "summary": compact_text(best.get("output_tail", ""), 500)}, global_enabled)
         critic = run_critic_if_due(cwd, core_prompt, args, state, iteration)
         if critic:
             state["last_critic"] = critic
@@ -942,7 +996,7 @@ def main(argv: list[str]) -> int:
                 render_dashboard(cwd, state)
                 print(f"✅ Completion promise detected; archived state at {archive}")
                 return 0
-            append_lesson(cwd, {"event": "review_veto", "reason": "promise", "iteration": iteration}, not args.no_global_lessons)
+            append_lesson(cwd, {"event": "review_veto", "reason": "promise", "iteration": iteration}, global_enabled)
             print("⚠️ Final reviewer did not approve promise exit; continuing.", flush=True)
 
         verifier_success = best.get("verifier_exit_code") == 0
@@ -957,7 +1011,7 @@ def main(argv: list[str]) -> int:
                 if args.review_command:
                     print("✅ Final review approved success exit.", flush=True)
                 return 0
-            append_lesson(cwd, {"event": "review_veto", "reason": "verifier", "iteration": iteration}, not args.no_global_lessons)
+            append_lesson(cwd, {"event": "review_veto", "reason": "verifier", "iteration": iteration}, global_enabled)
             print("⚠️ Final reviewer did not approve verifier exit; continuing.", flush=True)
 
         if args.human_checkpoint_every and iteration % args.human_checkpoint_every == 0:
@@ -972,7 +1026,7 @@ def main(argv: list[str]) -> int:
                 return 0
             archive = archive_state(cwd, state, "stuck")
             append_log(cwd, {"event": "pause", "reason": "stuck", "iteration": iteration, "archive": str(archive)})
-            append_lesson(cwd, {"event": "stuck_pause", "iteration": iteration, "stuck_reason": stuck_reason}, not args.no_global_lessons)
+            append_lesson(cwd, {"event": "stuck_pause", "iteration": iteration, "stuck_reason": stuck_reason}, global_enabled)
             render_dashboard(cwd, state)
             print(f"⏸️ Paused after {stagnant} no-progress isolated iteration(s); archived state at {archive}")
             return 0
