@@ -45,6 +45,9 @@ DEFAULT_VARIANTS = [
     "Stall-breaker: if no user files changed last iteration, modify the most relevant file now.",
 ]
 
+# Shared refusal regex; applied to the LAST 800 chars of output, never the full stream.
+REFUSAL_REGEX = re.compile(r"\b(can't|cannot|unable to|give up|not possible|as an ai)\b", re.I)
+
 PRESETS: dict[str, dict[str, Any]] = {
     "none": {},
     "coding": {"mode": "variants", "agent_switch_every": 4, "critic_every": 4},
@@ -453,8 +456,6 @@ def classify_stuck_reason(candidate: dict[str, Any], stagnant: int, previous_fai
     verifier = str(candidate.get("verifier_output_tail") or "")
     if candidate.get("agent_timeout") or candidate.get("timeout"):
         return "agent_timeout"
-    if re.search(r"\b(can't|cannot|unable to|give up|not possible|as an ai)\b", output, re.I):
-        return "model_refusal_or_give_up"
     if stagnant > 0:
         return "no_workspace_progress"
     if candidate.get("verifier_exit_code") not in (None, 0) and not verifier.strip():
@@ -466,6 +467,10 @@ def classify_stuck_reason(candidate: dict[str, Any], stagnant: int, previous_fai
         return "metric_missing"
     if candidate.get("accepted") is False:
         return "patch_rejected_by_policy"
+    # Refusal regex is the LAST resort and only scans the tail to avoid matching
+    # incidental language earlier in long agent outputs.
+    if REFUSAL_REGEX.search(output[-800:]):
+        return "model_refusal_or_give_up"
     return ""
 
 
