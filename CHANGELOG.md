@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] — 2026-05-25
+
+### Fixed
+- `--sandbox worktree` (now the default in git repos) silently dropped untracked main-tree files from the candidate workspace because the seed patch was forbidden from running `git add -N` on the main index. The runner now copies untracked files directly into the worktree, leaving the main index untouched.
+- Startup `--agent-command` validation passed a literal `{prompt_file}` token to the probe shell, causing valid commands of the documented `cmd {prompt_file}` form to fail the probe and abort the loop. The probe now substitutes a real temp file the same way `run_agent` does.
+- `state` did not record the `--global-lessons` opt-in, so `/wiggum-resume` could not re-apply it when restoring a stuck archive. The runner now persists `global_enabled` in `state` and the resume script honors it.
+
 ## [0.2.0] — 2026-05-25
 
 ### Breaking

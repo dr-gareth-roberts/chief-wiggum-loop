@@ -188,6 +188,28 @@ def copy_current_tree(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst, ignore=ignore)
 
 
+def _copy_untracked_into(cwd: Path, dst: Path) -> None:
+    # Mirror the main tree's untracked files into the worktree WITHOUT touching
+    # the main tree's git index. The `make_patch(cwd)` call above only captures
+    # tracked changes (we refuse to `git add -N` on the main tree); without
+    # this copy step the worktree would start without the user's new files
+    # and the agent/verifier would operate on an incomplete project.
+    raw = git_bytes(cwd, ["ls-files", "--others", "--exclude-standard", "-z"])
+    for entry in raw.split(b"\0"):
+        if not entry or entry.startswith(b".claude/wiggum-"):
+            continue
+        rel = entry.decode("utf-8", errors="replace")
+        src = cwd / rel
+        if not src.is_file():
+            continue
+        target = dst / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(src, target)
+        except OSError:
+            pass
+
+
 def create_candidate_workspace(cwd: Path, sandbox: str, iteration: int, candidate: int) -> tuple[Path, str, Path | None]:
     tmp_root = Path(tempfile.mkdtemp(prefix=f"wiggum-i{iteration}-c{candidate}-"))
     if sandbox == "worktree" and is_git_repo(cwd) and has_head(cwd):
@@ -197,6 +219,7 @@ def create_candidate_workspace(cwd: Path, sandbox: str, iteration: int, candidat
             base_patch = make_patch(cwd)
             if base_patch.strip():
                 apply_patch(worktree, base_patch)
+            _copy_untracked_into(cwd, worktree)
             # Turn the caller's current tracked/untracked baseline into the
             # candidate's temporary HEAD so the candidate patch contains only
             # this worker's delta, not pre-existing local files like logs.
@@ -699,9 +722,17 @@ def validate_agent_commands(commands: list[str], skip: bool) -> list[str]:
         return []
     errors: list[str] = []
     tmp = Path(tempfile.mkdtemp(prefix="wiggum-validate-"))
+    probe_prompt_path = tmp / "probe-prompt.md"
+    probe_prompt_path.write_text("noop\n", encoding="utf-8")
     try:
         for cmd in commands:
-            result = run_shell(cmd, tmp, 5, "noop\n")
+            # Substitute the documented {prompt_file} placeholder the same way
+            # run_agent() does; without this, commands like
+            # `claude --print < {prompt_file}` would fail the probe purely
+            # because the placeholder was passed through literally.
+            rendered = cmd.replace("{prompt_file}", shlex.quote(str(probe_prompt_path))).replace("{iteration}", "0")
+            stdin = None if "{prompt_file}" in cmd else "noop\n"
+            result = run_shell(rendered, tmp, 5, stdin)
             exit_code = int(result.get("exit_code") or 0)
             duration = float(result.get("duration_seconds") or 0.0)
             timeout = bool(result.get("timeout"))
@@ -834,6 +865,7 @@ def main(argv: list[str]) -> int:
         "agent_commands": args.agent_command,
         "agent_switch_every": args.agent_switch_every,
         "agent_timeout": args.agent_timeout,
+        "global_enabled": global_enabled,
         "max_iterations": args.max_iterations,
         "completion_promise": args.completion_promise,
         "success_command": args.success_command,
