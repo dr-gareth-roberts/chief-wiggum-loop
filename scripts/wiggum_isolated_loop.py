@@ -66,6 +66,11 @@ def compact_text(text: str, max_chars: int) -> str:
     return text[:half].rstrip() + "\n\n... [middle trimmed] ...\n\n" + text[-half:].lstrip()
 
 
+def extract_tagged(body: str, tag: str) -> str | None:
+    match = re.search(rf"<{tag}>(.*?)</{tag}>", body, flags=re.DOTALL)
+    return re.sub(r"\s+", " ", match.group(1).strip()) if match else None
+
+
 def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
@@ -298,11 +303,8 @@ def metric_improved(new: float | None, best: float | None, direction: str) -> bo
 def promise_was_met(output: str, expected: str | None) -> bool:
     if not expected:
         return False
-    match = re.search(r"<promise>(.*?)</promise>", output, flags=re.DOTALL)
-    if not match:
-        return False
-    actual = re.sub(r"\s+", " ", match.group(1).strip())
-    return actual == expected
+    actual = extract_tagged(output, "promise")
+    return actual is not None and actual == expected
 
 
 def read_prompt(args: argparse.Namespace) -> str:
@@ -638,7 +640,7 @@ def final_review_allows_exit(cwd: Path, core_prompt: str, args: argparse.Namespa
     body = str(review.get("output_tail") or "").strip()
     if body:
         append_section_to_summary(cwd, f"Final review for {reason}", body, args.summary_max_chars)
-    approved = promise_was_met(body.replace("<review>", "<promise>").replace("</review>", "</promise>"), args.review_approval_token)
+    approved = extract_tagged(body, "review") == args.review_approval_token
     append_log(cwd, {"event": "final_review", "reason": reason, "iteration": state.get("iteration"), "approved": approved, "review_exit_code": review.get("exit_code"), "review_timeout": review.get("timeout", False), "output_tail": body})
     return approved, review
 
