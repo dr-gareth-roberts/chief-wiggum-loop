@@ -718,7 +718,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--metric-name", default="", help="Metric name parsed from `METRIC name=value` lines")
     p.add_argument("--metric-direction", choices=["lower", "higher"], default="higher")
     p.add_argument("--acceptance", choices=["auto", "always", "verifier", "metric", "progress"], default="auto", help="Patch acceptance policy")
-    p.add_argument("--sandbox", choices=["none", "worktree", "copy"], default="none", help="Run worker in main tree or isolated candidate workspace")
+    p.add_argument("--sandbox", choices=["none", "worktree", "copy"], default=None, help="Run worker in main tree or isolated candidate workspace; default auto-upgrades to worktree when in a git repo with HEAD")
     p.add_argument("--candidates", type=int, default=1, help="Best-of-N candidates per iteration")
     p.add_argument("--candidate-concurrency", type=int, default=1, help="Parallel candidate workers")
     p.add_argument("--stuck-after", type=int, default=3, help="Pause after N no-progress iterations; 0 disables")
@@ -785,6 +785,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     if not numeric_ok:
         p.error("numeric flags must be non-negative and timeouts/counts must be positive where applicable")
+    if args.sandbox is None:
+        if is_git_repo(Path.cwd()) and has_head(Path.cwd()):
+            args.sandbox = "worktree"
+            print("[wiggum] auto-upgraded --sandbox to worktree (git repo with HEAD detected)", file=sys.stderr)
+        else:
+            args.sandbox = "none"
     return args
 
 
