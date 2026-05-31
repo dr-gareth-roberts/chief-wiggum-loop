@@ -20,7 +20,8 @@ Typical usage:
   "Fix the failing tests" \
   --agent-command "claude --print" \
   --success-command "npm test" \
-  --max-iterations 12
+  --max-iterations 12 \
+  --notify
 ```
 
 Multi-model batch + critic + final reviewer:
@@ -35,12 +36,21 @@ Multi-model batch + critic + final reviewer:
   --critic-every 4 \
   --review-command "claude --print" \
   --success-command "npm test" \
+  --agent-retries 1 \
   --max-iterations 24 \
   --mode variants \
-  --explain
+  --explain \
+  --notify
 ```
 
 `--explain` attaches the per-round `reason_signals` dict (`regex_hit`, `stagnant`, `verifier_changed`, `agent_timeout`, `metric_missing`) to each iteration entry in `.claude/wiggum-isolated.log.jsonl`, which makes it obvious which signal classified a round as stuck when post-mortem-ing a long multi-model run.
+
+Operational flags:
+
+- `--notify`: best-effort macOS terminal-state notification; missing `osascript` is a safe no-op.
+- `--agent-retries N`: retry short non-zero agent exits before treating the worker as failed.
+- `--no-agent-validation`: skip the startup probe for deliberately unusual or expensive agent commands.
+- `--explain`: write stuck-cause signal details into each iteration log entry.
 
 If the agent command needs a prompt-file argument instead of stdin, include `{prompt_file}`:
 

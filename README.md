@@ -4,14 +4,22 @@ Wiggum Loop is a safer, progress-aware variation on Anthropic's Ralph Loop plugi
 
 The original Ralph loop repeats the same prompt from a `Stop` hook inside the same Claude Code session. That is useful for short loops, but long runs accumulate chat history; eventually the model can drift, repeat itself, or give up. Wiggum keeps the Stop-hook option, but adds a **true isolated runner** that starts a fresh agent process for every iteration and carries only bounded file/ledger memory forward.
 
-## What's new in 0.2.0
+## What's new in 0.3.0
 
-Two breaking-default changes you should know about before upgrading:
+0.3.0 is an operability release for running Wiggum longer and recovering cleanly:
 
-- **Global lessons are now opt-in.** By default the isolated runner writes only to `.claude/wiggum-lessons.jsonl` inside the current project. Pass `--global-lessons` to also append to `~/.wiggum/lessons.jsonl`. The previous `--no-global-lessons` flag still works but is deprecated; it is no longer needed for the common case.
-- **`--sandbox` auto-upgrades to `worktree` in git repos.** When the current directory is a git repo with a valid `HEAD`, omitting `--sandbox` now selects `worktree` instead of `none`. Outside a git repo the default remains `none`. Pass `--sandbox none` explicitly if you want the worker to edit the main tree.
+- **`/wiggum-doctor`** checks Python, git, Claude CLI access, writable Wiggum state, active loop state, and stuck archives before a long run.
+- **`/wiggum-resume`** restores the most recent stuck isolated-loop archive and continues with the original prompt, summary, and persisted run choices.
+- **`--notify`** sends best-effort macOS desktop notifications when a loop finishes, pauses, or hits a budget. Missing `osascript` and non-macOS platforms are safe no-ops.
 
-See `CHANGELOG.md` for the full list of fixes and new flags (`--explain`, `--agent-retries`, `--no-agent-validation`, `--global-lessons`).
+The secondary reliability beat is safety and visibility: startup agent validation, `--agent-retries`, `--no-agent-validation`, `--explain`, always-on stuck-cause output, safer worktree/copy behavior, and shared `wiggum_core` helpers across entry points.
+
+Upgrade notes from 0.2.x:
+
+- Global lessons are opt-in. By default the isolated runner writes only to `.claude/wiggum-lessons.jsonl`; pass `--global-lessons` to also append to `~/.wiggum/lessons.jsonl`.
+- `--sandbox` auto-upgrades to `worktree` in git repos with a valid `HEAD`. Outside a git repo the default remains `none`; pass `--sandbox none` explicitly if you want direct main-tree edits.
+
+See `CHANGELOG.md` for the full list of 0.3.0 changes.
 
 ## Two operating modes
 
@@ -70,6 +78,9 @@ Key files:
 | Dashboard | no | yes | Writes `.claude/wiggum-dashboard.md/html`. |
 | Lessons DB | no | yes | Writes project and optional global failure lessons. |
 | Installer | yes | yes | `scripts/install-wiggum-plugin.sh`. |
+| Preflight doctor | yes | yes | `/wiggum-doctor` checks the local environment before a run. |
+| Resume stuck run | no | yes | `/wiggum-resume` restores the latest stuck archive and continues it. |
+| Desktop notification | no | yes | `--notify` reports terminal states on macOS when available. |
 
 ## Directory layout
 
@@ -84,17 +95,37 @@ ralph-wiggum-hook/
   scripts/status-wiggum-loop.sh
   scripts/wiggum-isolated-loop.sh
   scripts/wiggum_isolated_loop.py
+  scripts/wiggum-doctor.sh
+  scripts/wiggum-resume.sh
   scripts/install-wiggum-plugin.sh
   commands/wiggum-loop.md
   commands/cancel-wiggum.md
   commands/wiggum-status.md
   commands/wiggum-isolated.md
+  commands/wiggum-doctor.md
+  commands/wiggum-resume.md
   commands/install-wiggum.md
   tests/test-wiggum-loop.sh
   tests/test-wiggum-isolated-loop.sh
+  tests/test-smoke.sh
+  tests/run-all-tests.sh
 ```
 
 ## Quick usage
+
+### Preflight and resume
+
+```text
+/wiggum-doctor
+/wiggum-resume --max-iterations 6
+```
+
+Direct scripts:
+
+```bash
+./scripts/wiggum-doctor.sh
+./scripts/wiggum-resume.sh --max-iterations 6
+```
 
 ### Ralph-style Stop hook
 
@@ -116,7 +147,8 @@ Direct script:
   --agent-command "claude --print" \
   --success-command "npm test" \
   --max-iterations 20 \
-  --mode variants
+  --mode variants \
+  --notify
 ```
 
 The isolated runner stores:
@@ -158,6 +190,14 @@ If a command needs a prompt file instead of stdin, use `{prompt_file}`:
 
 - `--no-agent-validation`: by default the runner probes each `--agent-command` once at startup with a tiny stdin payload so a typo or missing binary fails fast. Pass `--no-agent-validation` to skip the probe (useful when the agent has expensive cold-start costs or refuses empty input).
 - `--agent-retries N` (default `1`): if an agent invocation exits non-zero in under 5 seconds, the runner retries it up to `N` times. This rides over transient rate-limit and network blips without giving up on a worker. Long-running failures are never retried.
+
+### Terminal-state notifications
+
+```bash
+--notify
+```
+
+On macOS, `--notify` sends a best-effort desktop notification when the isolated loop finishes, pauses, or stops on a budget. If `osascript` is missing, blocked, or unavailable on the platform, the notification is skipped without changing the loop exit status.
 
 ### Critic and final reviewer
 
@@ -371,10 +411,12 @@ If `~/.wiggum/` is read-only (for example, when Wiggum runs inside another sandb
   --candidates 2 \
   --candidate-concurrency 2 \
   --acceptance verifier \
+  --agent-retries 1 \
   --max-iterations 24 \
   --max-runtime-seconds 7200 \
   --human-checkpoint on-stuck \
-  --mode variants
+  --mode variants \
+  --notify
 ```
 
 In a git repo, `--sandbox worktree` is now the default and does not need to be passed explicitly. Lessons stay project-only by default, so `--no-global-lessons` is no longer required either — add `--global-lessons` if you want the shared `~/.wiggum/lessons.jsonl` history back.
@@ -421,6 +463,5 @@ Prefer sandboxed mode (the new default in git repos) for unattended code-writing
 ```bash
 cd ralph-wiggum-hook
 chmod +x hooks/*.sh hooks/wiggum_stop_hook.py scripts/*.sh tests/*.sh
-./tests/test-wiggum-loop.sh
-./tests/test-wiggum-isolated-loop.sh
+./tests/run-all-tests.sh
 ```

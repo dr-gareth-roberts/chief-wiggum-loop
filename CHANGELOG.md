@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] — 2026-05-31
+
+### Added
+- `/wiggum-doctor` runs preflight diagnostics for Python, git, Claude CLI access, writable Wiggum state, active loop state, and stuck archives before starting a long isolated run.
+- `/wiggum-resume` restores the latest stuck isolated-loop archive and replays the original invocation so paused work can continue with the existing prompt, summary, and state choices.
+- `--notify` adds best-effort macOS desktop notifications at terminal states. Notification failures, missing `osascript`, and non-macOS platforms are ignored so loop exits stay reliable.
+- Startup operability flags: `--agent-retries N` for short transient agent failures and `--no-agent-validation` for cases where startup probing is intentionally undesirable.
+- A new aggregate test harness runs both shell suites plus pytest, with additional smoke coverage for doctor, resume, and notify behavior.
+
+### Changed
+- README and slash-command docs now lead with `/wiggum-doctor`, `/wiggum-resume`, and `--notify`, with safety and stuck-cause visibility as the secondary reliability story.
+- Shared JSON, archive, git, time, text, and workspace-hash helpers now live in `scripts/wiggum_core.py`, reducing duplication between the Stop-hook loop and isolated runner.
+
+### Fixed
+- `--explain` attaches per-round stuck-cause signals to iteration logs, and pause output always prints the signal dict so no-progress, verifier, timeout, refusal, and metric-missing causes are visible without rerunning.
+- Safety fixes cover read-only `~/.wiggum/`, worktree sandbox preservation of untracked main-tree files, startup validation for `{prompt_file}` agent commands, scoped metric parsing, tag extraction, verifier-based `auto` acceptance, and resume persistence for global-lesson opt-in state.
+
 ## [0.2.1] — 2026-05-25
 
 ### Fixed

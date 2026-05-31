@@ -11,4 +11,5 @@ fi
 cd "$PLUGIN_ROOT"
 "$HERE/test-wiggum-loop.sh"
 "$HERE/test-wiggum-isolated-loop.sh"
+"$HERE/test-smoke.sh"
 python3 -m pytest tests/ -v --tb=short
