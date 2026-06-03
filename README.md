@@ -10,7 +10,7 @@ The original Ralph loop repeats the same prompt from a `Stop` hook inside the sa
 
 - **`/wiggum-doctor`** checks Python, git, Claude CLI access, writable Wiggum state, active loop state, and stuck archives before a long run.
 - **`/wiggum-resume`** restores the most recent stuck isolated-loop archive and continues with the original prompt, summary, and persisted run choices.
-- **`--notify`** sends best-effort macOS desktop notifications when a loop finishes, pauses, or hits a budget. Missing `osascript` and non-macOS platforms are safe no-ops.
+- **`--notify`** sends best-effort desktop notifications when a loop finishes, pauses, or hits a budget — macOS (`osascript`), Linux (`notify-send`), and Windows (PowerShell). A missing notifier or unsupported platform is a safe no-op.
 
 The secondary reliability beat is safety and visibility: startup agent validation, `--agent-retries`, `--no-agent-validation`, `--explain`, always-on stuck-cause output, safer worktree/copy behavior, and shared `wiggum_core` helpers across entry points.
 
@@ -80,13 +80,15 @@ Key files:
 | Installer | yes | yes | `scripts/install-wiggum-plugin.sh`. |
 | Preflight doctor | yes | yes | `/wiggum-doctor` checks the local environment before a run. |
 | Resume stuck run | no | yes | `/wiggum-resume` restores the latest stuck archive and continues it. |
-| Desktop notification | no | yes | `--notify` reports terminal states on macOS when available. |
+| Desktop notification | no | yes | `--notify` reports terminal states (macOS/Linux/Windows, best-effort). |
 
 ## Directory layout
 
 ```text
-ralph-wiggum-hook/
+chief-wiggum-loop/
   .claude-plugin/plugin.json
+  .github/workflows/ci.yml
+  pyproject.toml
   hooks/hooks.json
   hooks/wiggum-stop-hook.sh
   hooks/wiggum_stop_hook.py
@@ -95,6 +97,7 @@ ralph-wiggum-hook/
   scripts/status-wiggum-loop.sh
   scripts/wiggum-isolated-loop.sh
   scripts/wiggum_isolated_loop.py
+  scripts/wiggum_core.py
   scripts/wiggum-doctor.sh
   scripts/wiggum-resume.sh
   scripts/install-wiggum-plugin.sh
@@ -109,6 +112,10 @@ ralph-wiggum-hook/
   tests/test-wiggum-isolated-loop.sh
   tests/test-smoke.sh
   tests/run-all-tests.sh
+  tests/conftest.py
+  tests/test_units.py
+  tests/test_regressions.py
+  tests/test_integration.py
 ```
 
 ## Quick usage
@@ -197,7 +204,7 @@ If a command needs a prompt file instead of stdin, use `{prompt_file}`:
 --notify
 ```
 
-On macOS, `--notify` sends a best-effort desktop notification when the isolated loop finishes, pauses, or stops on a budget. If `osascript` is missing, blocked, or unavailable on the platform, the notification is skipped without changing the loop exit status.
+`--notify` sends a best-effort desktop notification when the isolated loop finishes, pauses, or stops on a budget. It uses `osascript` on macOS, `notify-send` on Linux, and a PowerShell balloon on Windows. If the relevant notifier is missing, blocked, or unavailable on the platform, the notification is skipped without changing the loop exit status.
 
 ### Critic and final reviewer
 
@@ -461,7 +468,16 @@ Prefer sandboxed mode (the new default in git repos) for unattended code-writing
 ## Tests
 
 ```bash
-cd ralph-wiggum-hook
+cd chief-wiggum-loop
 chmod +x hooks/*.sh hooks/wiggum_stop_hook.py scripts/*.sh tests/*.sh
 ./tests/run-all-tests.sh
+```
+
+`run-all-tests.sh` runs the shell suites and, when `pytest` is available, the
+Python unit/regression/integration suites. Linting and type-checking match CI:
+
+```bash
+pip install ruff mypy
+ruff check .
+mypy scripts hooks
 ```

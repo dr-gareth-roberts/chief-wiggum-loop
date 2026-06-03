@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- GitHub Actions CI: a test matrix (Python 3.9–3.12 × ubuntu/macOS) running the
+  full shell + pytest suite, plus a `ruff` + `mypy` lint job.
+- `pyproject.toml` with project metadata and `ruff`/`mypy` configuration.
+- Cross-platform `--notify`: Linux (`notify-send`) and Windows (PowerShell
+  balloon) in addition to macOS (`osascript`); unsupported platforms no-op.
+- Integration tests covering the isolated runner `main()` (promise-driven stop,
+  concurrent best-of-N over worktrees) and the Stop-hook decision/JSON output.
+
+### Changed
+- Best-of-N now computes the per-iteration worktree baseline (tracked diff +
+  untracked file list) once and shares it across candidates instead of
+  recomputing per candidate.
+
+### Fixed
+- `--preset` silently dropped any field whose value matched an argparse default
+  (e.g. `explore` ignored `candidates`/`agent_switch_every`, `cheap` ignored
+  `summary_max_chars`). Presets now apply to every flag the user did not pass
+  explicitly while still letting explicit flags win.
+- `git worktree add` for concurrent best-of-N candidates is serialized with a
+  lock so simultaneous workers can't race on shared repo metadata.
+
 ## [0.3.0] — 2026-05-31
 
 ### Added
