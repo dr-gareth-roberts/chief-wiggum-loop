@@ -13,8 +13,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = PLUGIN_ROOT / "scripts"
 STOP_HOOK = PLUGIN_ROOT / "hooks" / "wiggum_stop_hook.py"
