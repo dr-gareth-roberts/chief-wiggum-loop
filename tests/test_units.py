@@ -436,6 +436,45 @@ def test_parse_args_explicit_flag_overrides_preset(wil_module, in_nongit_dir):
     assert args.agent_switch_every == 9
 
 
+# --- notify (cross-platform) -------------------------------------------------
+
+
+def test_notify_command_macos(wil_module, monkeypatch):
+    monkeypatch.setattr(wil_module.sys, "platform", "darwin")
+    cmd = wil_module._notify_command("Wiggum", 'done "ok"')
+    assert cmd is not None
+    assert cmd[0] == "osascript"
+    # Embedded double quotes are downgraded to single quotes so the AppleScript
+    # string literal stays valid.
+    assert cmd[-1] == 'display notification "done \'ok\'" with title "Wiggum"'
+
+
+def test_notify_command_linux_uses_notify_send_when_present(wil_module, monkeypatch):
+    monkeypatch.setattr(wil_module.sys, "platform", "linux")
+    monkeypatch.setattr(wil_module.shutil, "which", lambda name: "/usr/bin/notify-send")
+    assert wil_module._notify_command("T", "M") == ["notify-send", "T", "M"]
+
+
+def test_notify_command_linux_without_notify_send_is_none(wil_module, monkeypatch):
+    monkeypatch.setattr(wil_module.sys, "platform", "linux")
+    monkeypatch.setattr(wil_module.shutil, "which", lambda name: None)
+    assert wil_module._notify_command("T", "M") is None
+
+
+def test_notify_command_windows_uses_powershell(wil_module, monkeypatch):
+    monkeypatch.setattr(wil_module.sys, "platform", "win32")
+    monkeypatch.setattr(wil_module.shutil, "which", lambda name: "powershell" if name == "powershell" else None)
+    cmd = wil_module._notify_command("T", "M")
+    assert cmd is not None and cmd[0] == "powershell" and "ShowBalloonTip" in cmd[-1]
+
+
+def test_notify_disabled_never_runs(wil_module, monkeypatch):
+    called = {"n": 0}
+    monkeypatch.setattr(wil_module.subprocess, "run", lambda *a, **k: called.__setitem__("n", called["n"] + 1))
+    wil_module.notify("T", "M", enabled=False)
+    assert called["n"] == 0
+
+
 def test_explicitly_passed_distinguishes_user_values_from_defaults(wil_module):
     import argparse
 

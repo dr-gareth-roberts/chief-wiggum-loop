@@ -103,17 +103,50 @@ def append_lesson(cwd: Path, lesson: dict[str, Any], global_enabled: bool = True
             append_log(cwd, {"event": "global_lessons_disabled", "reason": str(exc)})
 
 
+def _notify_command(title: str, message: str) -> list[str] | None:
+    """Build a best-effort desktop-notification command for the current OS.
+
+    Returns ``None`` when no supported mechanism is available so the caller can
+    no-op. macOS uses ``osascript``, Linux uses ``notify-send`` (if present),
+    and Windows uses a small PowerShell toast/balloon snippet.
+    """
+    if sys.platform == "darwin":
+        safe_title = title.replace('"', "'")
+        safe_message = message.replace('"', "'")
+        return ["osascript", "-e", f'display notification "{safe_message}" with title "{safe_title}"']
+    if sys.platform.startswith("linux"):
+        if shutil.which("notify-send"):
+            return ["notify-send", title, message]
+        return None
+    if sys.platform.startswith("win"):
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        if not powershell:
+            return None
+        # Escape single quotes for the PowerShell single-quoted string literals.
+        safe_title = title.replace("'", "''")
+        safe_message = message.replace("'", "''")
+        script = (
+            "[void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms');"
+            "$n=New-Object System.Windows.Forms.NotifyIcon;"
+            "$n.Icon=[System.Drawing.SystemIcons]::Information;$n.Visible=$true;"
+            f"$n.ShowBalloonTip(5000,'{safe_title}','{safe_message}',"
+            "[System.Windows.Forms.ToolTipIcon]::Info)"
+        )
+        return [powershell, "-NoProfile", "-Command", script]
+    return None
+
+
 def notify(title: str, message: str, enabled: bool) -> None:
-    # Best-effort macOS desktop notification at terminal-state transitions; any
-    # failure (missing osascript, blocked daemon, etc.) is silently ignored so
-    # the loop never derails on a cosmetic side-effect.
-    if not enabled or sys.platform != "darwin":
+    # Best-effort desktop notification at terminal-state transitions; any failure
+    # (missing notifier binary, blocked daemon, unsupported OS, etc.) is silently
+    # ignored so the loop never derails on a cosmetic side-effect.
+    if not enabled:
         return
-    safe_title = title.replace('"', "'")
-    safe_message = message.replace('"', "'")
-    script = f'display notification "{safe_message}" with title "{safe_title}"'
+    command = _notify_command(title, message)
+    if command is None:
+        return
     try:
-        subprocess.run(["osascript", "-e", script], timeout=5, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(command, timeout=5, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
 
@@ -816,7 +849,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--no-global-lessons", action="store_true", help="Deprecated alias kept for backwards compatibility; global lessons are now opt-in via --global-lessons")
     p.add_argument("--no-agent-validation", action="store_true", help="Skip the startup probe that runs each --agent-command with stdin to catch missing/broken commands")
     p.add_argument("--explain", action="store_true", default=False, help="Attach the per-round stuck reason signals to the iteration log entry")
-    p.add_argument("--notify", action="store_true", help="On macOS, display a desktop notification when the loop reaches a terminal state")
+    p.add_argument("--notify", action="store_true", help="Best-effort desktop notification on terminal states (macOS osascript, Linux notify-send, Windows PowerShell)")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
     # Apply presets to flags the user did NOT pass explicitly. We can't tell an
