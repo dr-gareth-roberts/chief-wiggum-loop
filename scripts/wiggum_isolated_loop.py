@@ -15,7 +15,6 @@ import hashlib
 import html
 import json
 import os
-from pathlib import Path
 import re
 import shlex
 import shutil
@@ -23,18 +22,26 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 from typing import Any
 
 from wiggum_core import (
     append_jsonl,
-    archive_state as _archive_state,
     atomic_write_json,
     compact_text,
+    decode_stream,
     git_bytes,
     is_git_repo,
     run_git,
     utc_now,
+)
+from wiggum_core import (
+    archive_state as _archive_state,
+)
+from wiggum_core import (
     wiggum_pathspec_isolated as wiggum_pathspec,
+)
+from wiggum_core import (
     workspace_hash as _workspace_hash,
 )
 
@@ -128,7 +135,7 @@ def run_shell(command: str, cwd: Path, timeout: int, stdin_text: str | None = No
         output = (result.stdout or "") + (result.stderr or "")
         return {"exit_code": result.returncode, "output": output, "timeout": False, "duration_seconds": time.monotonic() - started}
     except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or "") + (exc.stderr or "")
+        output = decode_stream(exc.stdout) + decode_stream(exc.stderr)
         return {"exit_code": 124, "output": output, "timeout": True, "duration_seconds": time.monotonic() - started}
 
 

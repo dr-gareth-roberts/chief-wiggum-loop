@@ -22,10 +22,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from wiggum_core import (  # noqa: E402  (sys.path manipulation must come first)
     append_jsonl,
-    archive_state as _archive_state,
     atomic_write_json,
+    decode_stream,
     utc_now,
     wiggum_pathspec_stop_hook,
+)
+from wiggum_core import (
+    archive_state as _archive_state,
+)
+from wiggum_core import (
     workspace_hash as _workspace_hash,
 )
 
@@ -134,7 +139,7 @@ def run_command(command: str, cwd: Path, timeout_seconds: int) -> dict[str, Any]
         output = (result.stdout + result.stderr)[-4000:]
         return {"configured": True, "exit_code": result.returncode, "output_tail": output}
     except subprocess.TimeoutExpired as exc:
-        output = ((exc.stdout or "") + (exc.stderr or ""))[-4000:]
+        output = (decode_stream(exc.stdout) + decode_stream(exc.stderr))[-4000:]
         return {"configured": True, "exit_code": 124, "output_tail": output, "timeout": True}
 
 

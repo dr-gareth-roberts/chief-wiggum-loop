@@ -1,0 +1,36 @@
+[project]
+name = "wiggum-loop"
+version = "0.3.0"
+description = "Progress-aware Ralph Wiggum loop automation for Claude Code"
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "mypy"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 160
+extend-exclude = ["**/__pycache__"]
+
+[tool.ruff.lint]
+# Pyflakes (F), pycodestyle (E/W), isort (I), and pyupgrade (UP). E501 is left
+# off because several controller log/format lines are intentionally long.
+select = ["E", "F", "W", "I", "UP"]
+# E501: several controller log/format lines are intentionally long.
+# UP022: the explicit stdout/stderr=PIPE calls are deliberate and stay readable.
+ignore = ["E501", "UP022"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests manipulate sys.path before importing the plugin modules.
+"tests/conftest.py" = ["E402"]
+
+[tool.mypy]
+# The plugin runs on 3.9+ (enforced by the test matrix), but recent mypy only
+# accepts >=3.10 as an analysis target; 3.10 semantics are a safe superset here.
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
+# The codebase is typed but pragmatic; keep strictness moderate so CI is
+# actionable rather than noisy.
+check_untyped_defs = true

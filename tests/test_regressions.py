@@ -12,13 +12,10 @@ from __future__ import annotations
 import json
 import os
 import platform
-import stat
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
-
 
 # --- helpers -----------------------------------------------------------------
 
