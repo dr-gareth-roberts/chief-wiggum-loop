@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,10 @@ DASHBOARD_HTML_REL = Path(".claude/wiggum-dashboard.html")
 CHECKPOINT_REL = Path(".claude/wiggum-checkpoint.local.md")
 PROJECT_LESSONS_REL = Path(".claude/wiggum-lessons.jsonl")
 GLOBAL_LESSONS = Path.home() / ".wiggum" / "lessons.jsonl"
+
+# Serializes `git worktree add` across concurrent best-of-N candidate threads,
+# which all target the same shared repo metadata.
+_WORKTREE_LOCK = threading.Lock()
 
 DEFAULT_VARIANTS = [
     "Smallest verifiable improvement: change one thing and run the check.",
@@ -228,17 +233,26 @@ def copy_current_tree(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst, ignore=ignore)
 
 
-def _copy_untracked_into(cwd: Path, dst: Path) -> None:
+def list_untracked(cwd: Path) -> list[str]:
+    """Return the main tree's untracked, non-ignored paths (excluding our state)."""
+    if not is_git_repo(cwd):
+        return []
+    raw = git_bytes(cwd, ["ls-files", "--others", "--exclude-standard", "-z"])
+    out: list[str] = []
+    for entry in raw.split(b"\0"):
+        if not entry or entry.startswith(b".claude/wiggum-"):
+            continue
+        out.append(entry.decode("utf-8", errors="replace"))
+    return out
+
+
+def _copy_untracked_into(cwd: Path, dst: Path, untracked: list[str] | None = None) -> None:
     # Mirror the main tree's untracked files into the worktree WITHOUT touching
     # the main tree's git index. The `make_patch(cwd)` call above only captures
     # tracked changes (we refuse to `git add -N` on the main tree); without
     # this copy step the worktree would start without the user's new files
     # and the agent/verifier would operate on an incomplete project.
-    raw = git_bytes(cwd, ["ls-files", "--others", "--exclude-standard", "-z"])
-    for entry in raw.split(b"\0"):
-        if not entry or entry.startswith(b".claude/wiggum-"):
-            continue
-        rel = entry.decode("utf-8", errors="replace")
+    for rel in untracked if untracked is not None else list_untracked(cwd):
         src = cwd / rel
         if not src.is_file():
             continue
@@ -250,16 +264,28 @@ def _copy_untracked_into(cwd: Path, dst: Path) -> None:
             pass
 
 
-def create_candidate_workspace(cwd: Path, sandbox: str, iteration: int, candidate: int) -> tuple[Path, str, Path | None]:
+def create_candidate_workspace(
+    cwd: Path,
+    sandbox: str,
+    iteration: int,
+    candidate: int,
+    base_patch: str | None = None,
+    untracked: list[str] | None = None,
+) -> tuple[Path, str, Path | None]:
     tmp_root = Path(tempfile.mkdtemp(prefix=f"wiggum-i{iteration}-c{candidate}-"))
     if sandbox == "worktree" and is_git_repo(cwd) and has_head(cwd):
         worktree = tmp_root / "worktree"
-        result = run_git(cwd, ["worktree", "add", "--detach", str(worktree), "HEAD"], timeout=30)
+        # `git worktree add` mutates shared repo metadata (.git/worktrees, refs).
+        # Serialize it so concurrent best-of-N candidates can't race the index.
+        with _WORKTREE_LOCK:
+            result = run_git(cwd, ["worktree", "add", "--detach", str(worktree), "HEAD"], timeout=30)
         if result.get("exit_code") == 0:
-            base_patch = make_patch(cwd)
-            if base_patch.strip():
-                apply_patch(worktree, base_patch)
-            _copy_untracked_into(cwd, worktree)
+            # Reuse the per-iteration baseline when the caller precomputed it so
+            # we don't re-run `git diff`/`ls-files` once per candidate.
+            patch = base_patch if base_patch is not None else make_patch(cwd)
+            if patch.strip():
+                apply_patch(worktree, patch)
+            _copy_untracked_into(cwd, worktree, untracked)
             # Turn the caller's current tracked/untracked baseline into the
             # candidate's temporary HEAD so the candidate patch contains only
             # this worker's delta, not pre-existing local files like logs.
@@ -572,14 +598,14 @@ def build_iteration_prompt(core_prompt: str, args: argparse.Namespace, iteration
     return "\n".join(lines)
 
 
-def run_candidate(cwd: Path, core_prompt: str, args: argparse.Namespace, state: dict[str, Any], iteration: int, candidate_index: int, last_agent: dict[str, Any] | None, mutation_hint: str) -> dict[str, Any]:
+def run_candidate(cwd: Path, core_prompt: str, args: argparse.Namespace, state: dict[str, Any], iteration: int, candidate_index: int, last_agent: dict[str, Any] | None, mutation_hint: str, base_patch: str | None = None, untracked: list[str] | None = None) -> dict[str, Any]:
     needs_sandbox = args.sandbox != "none" or args.candidates > 1 or args.acceptance in {"verifier", "metric", "progress"}
     sandbox = args.sandbox if needs_sandbox else "none"
     candidate_cwd = cwd
     sandbox_kind = "none"
     sandbox_root: Path | None = None
     if sandbox != "none":
-        candidate_cwd, sandbox_kind, sandbox_root = create_candidate_workspace(cwd, sandbox, iteration, candidate_index)
+        candidate_cwd, sandbox_kind, sandbox_root = create_candidate_workspace(cwd, sandbox, iteration, candidate_index, base_patch=base_patch, untracked=untracked)
 
     memory_summary = "" if args.mode == "exact" else read_summary(cwd, args.summary_max_chars)
     prompt = build_iteration_prompt(core_prompt, args, iteration, int(state.get("stagnant_iterations") or 0), last_agent, memory_summary, mutation_hint)
@@ -1000,8 +1026,14 @@ def main(argv: list[str]) -> int:
         baseline_hash = _workspace_hash(cwd, wiggum_pathspec)
         candidate_indexes = list(range(1, args.candidates + 1))
         candidates: list[dict[str, Any]] = []
+        # Compute the worktree baseline (tracked diff + untracked file list) once
+        # per iteration instead of once per candidate; every candidate seeds from
+        # the same snapshot of the main tree.
+        use_worktree = args.sandbox == "worktree" and is_git_repo(cwd) and has_head(cwd)
+        iter_base_patch = make_patch(cwd) if use_worktree else None
+        iter_untracked = list_untracked(cwd) if use_worktree else None
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.candidate_concurrency, args.candidates)) as ex:
-            futures = [ex.submit(run_candidate, cwd, core_prompt, args, state, iteration, idx, last_agent, mutation_hint) for idx in candidate_indexes]
+            futures = [ex.submit(run_candidate, cwd, core_prompt, args, state, iteration, idx, last_agent, mutation_hint, iter_base_patch, iter_untracked) for idx in candidate_indexes]
             for fut in concurrent.futures.as_completed(futures):
                 candidates.append(fut.result())
         candidates.sort(key=lambda c: c.get("candidate", 0))
