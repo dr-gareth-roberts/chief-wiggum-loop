@@ -747,6 +747,25 @@ def validate_agent_commands(commands: list[str], skip: bool) -> list[str]:
     return errors
 
 
+def explicitly_passed(parser: argparse.ArgumentParser, argv: list[str]) -> set[str]:
+    """Return the set of dest names the user actually passed on the command line.
+
+    argparse fills defaults into the parsed namespace, so a value of ``4`` could
+    mean "user passed 4" or "argparse default 4". To disambiguate we reparse the
+    same argv with every action's default suppressed; only user-supplied dests
+    appear in the resulting namespace.
+    """
+    saved = [(action, action.default) for action in parser._actions]
+    try:
+        for action, _ in saved:
+            action.default = argparse.SUPPRESS
+        parsed = parser.parse_args(argv, namespace=argparse.Namespace())
+    finally:
+        for action, default in saved:
+            action.default = default
+    return set(vars(parsed))
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run a true-isolated Wiggum loop using fresh agent subprocesses.")
     p.add_argument("prompt", nargs="*", help="Core prompt text")
@@ -793,11 +812,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--notify", action="store_true", help="On macOS, display a desktop notification when the loop reaches a terminal state")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
+    # Apply presets to flags the user did NOT pass explicitly. We can't tell an
+    # argparse default apart from a user-supplied value by inspecting the parsed
+    # namespace, so we reparse with every default suppressed: the keys that
+    # survive are exactly the ones the user provided on the command line.
+    explicit = explicitly_passed(p, argv)
     preset = PRESETS.get(args.preset, {})
     for key, value in preset.items():
-        if key == "review_required":
+        if key == "review_required" or not hasattr(args, key):
             continue
-        if getattr(args, key, None) in (None, "", 0, "reflective"):
+        if key not in explicit:
             setattr(args, key, value)
     if args.allow_infinite:
         args.max_iterations = 0

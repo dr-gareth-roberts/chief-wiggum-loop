@@ -402,3 +402,53 @@ def test_select_agent_command_candidates_stagger(wil_module, make_args):
     assert wil_module.select_agent_command(args, iteration=1, candidate=2) == ("cmd1", 1)
     assert wil_module.select_agent_command(args, iteration=3, candidate=1) == ("cmd1", 1)
     assert wil_module.select_agent_command(args, iteration=3, candidate=2) == ("cmd0", 0)
+
+
+# --- parse_args preset resolution --------------------------------------------
+
+
+@pytest.fixture
+def in_nongit_dir(tmp_path, monkeypatch):
+    """Run parse_args from a non-git dir so --sandbox stays 'none' (no auto-upgrade noise)."""
+
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+@pytest.mark.parametrize(
+    "preset, expected",
+    [
+        # Regression: these fields have non-sentinel argparse defaults, so the
+        # old `getattr(args, key) in (None, "", 0, "reflective")` merge silently
+        # dropped them. They must now reflect the preset.
+        ("explore", {"agent_switch_every": 2, "candidates": 2, "mode": "variants", "critic_every": 2}),
+        ("cheap", {"agent_switch_every": 6, "summary_max_chars": 4000, "mode": "reflective"}),
+        ("review-heavy", {"agent_switch_every": 3, "critic_every": 3, "mode": "variants"}),
+        ("coding", {"agent_switch_every": 4, "critic_every": 4, "mode": "variants"}),
+    ],
+)
+def test_parse_args_preset_applies_non_sentinel_defaults(wil_module, in_nongit_dir, preset, expected):
+    args = wil_module.parse_args(["--preset", preset, "do the thing"])
+    for key, value in expected.items():
+        assert getattr(args, key) == value, f"{preset}.{key}"
+
+
+def test_parse_args_explicit_flag_overrides_preset(wil_module, in_nongit_dir):
+    args = wil_module.parse_args(
+        ["--preset", "explore", "--candidates", "5", "--agent-switch-every", "9", "task"]
+    )
+    assert args.candidates == 5
+    assert args.agent_switch_every == 9
+
+
+def test_explicitly_passed_distinguishes_user_values_from_defaults(wil_module):
+    import argparse
+
+    p = argparse.ArgumentParser()
+    p.add_argument("--alpha", type=int, default=4)
+    p.add_argument("--beta", type=int, default=1)
+    passed = wil_module.explicitly_passed(p, ["--alpha", "4"])
+    assert "alpha" in passed
+    assert "beta" not in passed
+    # The parser's real defaults must be restored after the probe.
+    assert p.parse_args([]).alpha == 4
