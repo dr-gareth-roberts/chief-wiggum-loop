@@ -473,8 +473,9 @@ chmod +x hooks/*.sh hooks/wiggum_stop_hook.py scripts/*.sh tests/*.sh
 ./tests/run-all-tests.sh
 ```
 
-`run-all-tests.sh` runs the shell suites and, when `pytest` is available, the
-Python unit/regression/integration suites. Linting and type-checking match CI:
+`run-all-tests.sh` runs the shell suites and then the Python
+unit/regression/integration suites; it exits with an error if `pytest` is not
+installed. Linting and type-checking match CI:
 
 ```bash
 pip install ruff mypy

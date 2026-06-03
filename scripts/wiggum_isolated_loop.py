@@ -121,7 +121,9 @@ def _notify_command(title: str, message: str) -> list[str] | None:
         return ["osascript", "-e", f'display notification "{safe_message}" with title "{safe_title}"']
     if sys.platform.startswith("linux"):
         if shutil.which("notify-send"):
-            return ["notify-send", title, message]
+            # `--` terminates options so a title starting with `-` is treated as
+            # the summary rather than a flag.
+            return ["notify-send", "--", title, message]
         return None
     if sys.platform.startswith("win"):
         powershell = shutil.which("powershell") or shutil.which("pwsh")

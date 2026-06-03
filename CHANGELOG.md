@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
-- GitHub Actions CI: a test matrix (Python 3.9–3.12 × ubuntu/macOS) running the
+- GitHub Actions CI: a test matrix (Python 3.9–3.12 × Ubuntu/macOS) running the
   full shell + pytest suite, plus a `ruff` + `mypy` lint job.
 - `pyproject.toml` with project metadata and `ruff`/`mypy` configuration.
 - Cross-platform `--notify`: Linux (`notify-send`) and Windows (PowerShell
