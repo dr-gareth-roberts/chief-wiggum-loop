@@ -8,11 +8,9 @@ through ``parse_args`` (which inspects the cwd and can mutate ``--sandbox``).
 from __future__ import annotations
 
 import os
-import re
-from pathlib import Path
+import subprocess
 
 import pytest
-
 
 # --- parse_metrics -----------------------------------------------------------
 
@@ -402,3 +400,160 @@ def test_select_agent_command_candidates_stagger(wil_module, make_args):
     assert wil_module.select_agent_command(args, iteration=1, candidate=2) == ("cmd1", 1)
     assert wil_module.select_agent_command(args, iteration=3, candidate=1) == ("cmd1", 1)
     assert wil_module.select_agent_command(args, iteration=3, candidate=2) == ("cmd0", 0)
+
+
+# --- parse_args preset resolution --------------------------------------------
+
+
+@pytest.fixture
+def in_nongit_dir(tmp_path, monkeypatch):
+    """Run parse_args from a non-git dir so --sandbox stays 'none' (no auto-upgrade noise)."""
+
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+@pytest.mark.parametrize(
+    "preset, expected",
+    [
+        # Regression: these fields have non-sentinel argparse defaults, so the
+        # old `getattr(args, key) in (None, "", 0, "reflective")` merge silently
+        # dropped them. They must now reflect the preset.
+        ("explore", {"agent_switch_every": 2, "candidates": 2, "mode": "variants", "critic_every": 2}),
+        ("cheap", {"agent_switch_every": 6, "summary_max_chars": 4000, "mode": "reflective"}),
+        ("review-heavy", {"agent_switch_every": 3, "critic_every": 3, "mode": "variants"}),
+        ("coding", {"agent_switch_every": 4, "critic_every": 4, "mode": "variants"}),
+    ],
+)
+def test_parse_args_preset_applies_non_sentinel_defaults(wil_module, in_nongit_dir, preset, expected):
+    args = wil_module.parse_args(["--preset", preset, "do the thing"])
+    for key, value in expected.items():
+        assert getattr(args, key) == value, f"{preset}.{key}"
+
+
+def test_parse_args_explicit_flag_overrides_preset(wil_module, in_nongit_dir):
+    args = wil_module.parse_args(
+        ["--preset", "explore", "--candidates", "5", "--agent-switch-every", "9", "task"]
+    )
+    assert args.candidates == 5
+    assert args.agent_switch_every == 9
+
+
+def test_parse_args_preset_skips_review_required_pseudo_key(wil_module, in_nongit_dir):
+    # `review_required` is a preset-only marker (review-heavy), not a CLI flag.
+    # The merge must not graft it onto the namespace as a stray attribute.
+    assert "review_required" in wil_module.PRESETS["review-heavy"]
+    args = wil_module.parse_args(["--preset", "review-heavy", "task"])
+    assert not hasattr(args, "review_required")
+
+
+# --- notify (cross-platform) -------------------------------------------------
+
+
+def test_notify_command_macos(wil_module, monkeypatch):
+    monkeypatch.setattr(wil_module.sys, "platform", "darwin")
+    cmd = wil_module._notify_command("Wiggum", 'done "ok"')
+    assert cmd is not None
+    assert cmd[0] == "osascript"
+    # Embedded double quotes are downgraded to single quotes so the AppleScript
+    # string literal stays valid.
+    assert cmd[-1] == 'display notification "done \'ok\'" with title "Wiggum"'
+
+
+def test_notify_command_linux_uses_notify_send_when_present(wil_module, monkeypatch):
+    monkeypatch.setattr(wil_module.sys, "platform", "linux")
+    monkeypatch.setattr(wil_module.shutil, "which", lambda name: "/usr/bin/notify-send")
+    # `--` guards against titles/messages that start with a dash.
+    assert wil_module._notify_command("T", "M") == ["notify-send", "--", "T", "M"]
+
+
+def test_notify_command_linux_without_notify_send_is_none(wil_module, monkeypatch):
+    monkeypatch.setattr(wil_module.sys, "platform", "linux")
+    monkeypatch.setattr(wil_module.shutil, "which", lambda name: None)
+    assert wil_module._notify_command("T", "M") is None
+
+
+def test_notify_command_windows_uses_powershell(wil_module, monkeypatch):
+    monkeypatch.setattr(wil_module.sys, "platform", "win32")
+    monkeypatch.setattr(wil_module.shutil, "which", lambda name: "powershell" if name == "powershell" else None)
+    cmd = wil_module._notify_command("T", "M")
+    assert cmd is not None and cmd[0] == "powershell" and "ShowBalloonTip" in cmd[-1]
+
+
+def test_notify_command_windows_without_powershell_is_none(wil_module, monkeypatch):
+    monkeypatch.setattr(wil_module.sys, "platform", "win32")
+    monkeypatch.setattr(wil_module.shutil, "which", lambda name: None)
+    assert wil_module._notify_command("T", "M") is None
+
+
+def test_notify_command_unsupported_platform_is_none(wil_module, monkeypatch):
+    monkeypatch.setattr(wil_module.sys, "platform", "freebsd12")
+    assert wil_module._notify_command("T", "M") is None
+
+
+def test_notify_disabled_never_runs(wil_module, monkeypatch):
+    called = {"n": 0}
+    monkeypatch.setattr(wil_module.subprocess, "run", lambda *a, **k: called.__setitem__("n", called["n"] + 1))
+    wil_module.notify("T", "M", enabled=False)
+    assert called["n"] == 0
+
+
+def test_notify_noop_when_no_command(wil_module, monkeypatch):
+    called = {"n": 0}
+    monkeypatch.setattr(wil_module, "_notify_command", lambda *a: None)
+    monkeypatch.setattr(wil_module.subprocess, "run", lambda *a, **k: called.__setitem__("n", called["n"] + 1))
+    wil_module.notify("T", "M", enabled=True)
+    assert called["n"] == 0
+
+
+def test_explicitly_passed_distinguishes_user_values_from_defaults(wil_module):
+    import argparse
+
+    p = argparse.ArgumentParser()
+    p.add_argument("--alpha", type=int, default=4)
+    p.add_argument("--beta", type=int, default=1)
+    passed = wil_module.explicitly_passed(p, ["--alpha", "4"])
+    assert "alpha" in passed
+    assert "beta" not in passed
+    # The parser's real defaults must be restored after the probe.
+    assert p.parse_args([]).alpha == 4
+
+
+# --- decode_stream / list_untracked ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (b"bytes\xff", "bytes\ufffd"),  # invalid utf-8 byte is replaced, not raised
+        ("text", "text"),
+        (None, ""),
+    ],
+)
+def test_decode_stream_coerces_subprocess_streams(wil_module, value, expected):
+    assert wil_module.decode_stream(value) == expected
+
+
+def test_list_untracked_reports_new_files_and_ignores_state(wil_module, tmp_path):
+    env = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_AUTHOR_NAME": "wiggum",
+        "GIT_AUTHOR_EMAIL": "wiggum@example.invalid",
+        "GIT_COMMITTER_NAME": "wiggum",
+        "GIT_COMMITTER_EMAIL": "wiggum@example.invalid",
+    }
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, env=env, check=True)
+    (tmp_path / "new.txt").write_text("hi\n", encoding="utf-8")
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "wiggum-isolated.local.json").write_text("{}", encoding="utf-8")
+
+    untracked = wil_module.list_untracked(tmp_path)
+    assert "new.txt" in untracked
+    # Our own state files are excluded so candidate seeding never copies them.
+    assert not any(p.startswith(".claude/wiggum-") for p in untracked)
+
+
+def test_list_untracked_non_git_dir_is_empty(wil_module, tmp_path):
+    assert wil_module.list_untracked(tmp_path) == []

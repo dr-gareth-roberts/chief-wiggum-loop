@@ -37,6 +37,18 @@ def utc_now() -> str:
 # --- text --------------------------------------------------------------------
 
 
+def decode_stream(part: Any) -> str:
+    """Coerce a subprocess stream (str, bytes, or None) to text.
+
+    ``subprocess`` returns ``str`` when ``text=True``, but ``TimeoutExpired``
+    types its ``stdout``/``stderr`` loosely, so callers handling the timeout
+    branch normalize through here to stay both type-safe and bytes-safe.
+    """
+    if isinstance(part, bytes):
+        return part.decode("utf-8", errors="replace")
+    return part or ""
+
+
 def compact_text(text: str, max_chars: int) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text.strip())
     if len(text) <= max_chars:

@@ -15,26 +15,34 @@ import hashlib
 import html
 import json
 import os
-from pathlib import Path
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from wiggum_core import (
     append_jsonl,
-    archive_state as _archive_state,
     atomic_write_json,
     compact_text,
+    decode_stream,
     git_bytes,
     is_git_repo,
     run_git,
     utc_now,
+)
+from wiggum_core import (
+    archive_state as _archive_state,
+)
+from wiggum_core import (
     wiggum_pathspec_isolated as wiggum_pathspec,
+)
+from wiggum_core import (
     workspace_hash as _workspace_hash,
 )
 
@@ -47,6 +55,10 @@ DASHBOARD_HTML_REL = Path(".claude/wiggum-dashboard.html")
 CHECKPOINT_REL = Path(".claude/wiggum-checkpoint.local.md")
 PROJECT_LESSONS_REL = Path(".claude/wiggum-lessons.jsonl")
 GLOBAL_LESSONS = Path.home() / ".wiggum" / "lessons.jsonl"
+
+# Serializes `git worktree add` across concurrent best-of-N candidate threads,
+# which all target the same shared repo metadata.
+_WORKTREE_LOCK = threading.Lock()
 
 DEFAULT_VARIANTS = [
     "Smallest verifiable improvement: change one thing and run the check.",
@@ -96,17 +108,52 @@ def append_lesson(cwd: Path, lesson: dict[str, Any], global_enabled: bool = True
             append_log(cwd, {"event": "global_lessons_disabled", "reason": str(exc)})
 
 
+def _notify_command(title: str, message: str) -> list[str] | None:
+    """Build a best-effort desktop-notification command for the current OS.
+
+    Returns ``None`` when no supported mechanism is available so the caller can
+    no-op. macOS uses ``osascript``, Linux uses ``notify-send`` (if present),
+    and Windows uses a small PowerShell toast/balloon snippet.
+    """
+    if sys.platform == "darwin":
+        safe_title = title.replace('"', "'")
+        safe_message = message.replace('"', "'")
+        return ["osascript", "-e", f'display notification "{safe_message}" with title "{safe_title}"']
+    if sys.platform.startswith("linux"):
+        if shutil.which("notify-send"):
+            # `--` terminates options so a title starting with `-` is treated as
+            # the summary rather than a flag.
+            return ["notify-send", "--", title, message]
+        return None
+    if sys.platform.startswith("win"):
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        if not powershell:
+            return None
+        # Escape single quotes for the PowerShell single-quoted string literals.
+        safe_title = title.replace("'", "''")
+        safe_message = message.replace("'", "''")
+        script = (
+            "[void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms');"
+            "$n=New-Object System.Windows.Forms.NotifyIcon;"
+            "$n.Icon=[System.Drawing.SystemIcons]::Information;$n.Visible=$true;"
+            f"$n.ShowBalloonTip(5000,'{safe_title}','{safe_message}',"
+            "[System.Windows.Forms.ToolTipIcon]::Info)"
+        )
+        return [powershell, "-NoProfile", "-Command", script]
+    return None
+
+
 def notify(title: str, message: str, enabled: bool) -> None:
-    # Best-effort macOS desktop notification at terminal-state transitions; any
-    # failure (missing osascript, blocked daemon, etc.) is silently ignored so
-    # the loop never derails on a cosmetic side-effect.
-    if not enabled or sys.platform != "darwin":
+    # Best-effort desktop notification at terminal-state transitions; any failure
+    # (missing notifier binary, blocked daemon, unsupported OS, etc.) is silently
+    # ignored so the loop never derails on a cosmetic side-effect.
+    if not enabled:
         return
-    safe_title = title.replace('"', "'")
-    safe_message = message.replace('"', "'")
-    script = f'display notification "{safe_message}" with title "{safe_title}"'
+    command = _notify_command(title, message)
+    if command is None:
+        return
     try:
-        subprocess.run(["osascript", "-e", script], timeout=5, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(command, timeout=5, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
 
@@ -128,7 +175,7 @@ def run_shell(command: str, cwd: Path, timeout: int, stdin_text: str | None = No
         output = (result.stdout or "") + (result.stderr or "")
         return {"exit_code": result.returncode, "output": output, "timeout": False, "duration_seconds": time.monotonic() - started}
     except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or "") + (exc.stderr or "")
+        output = decode_stream(exc.stdout) + decode_stream(exc.stderr)
         return {"exit_code": 124, "output": output, "timeout": True, "duration_seconds": time.monotonic() - started}
 
 
@@ -188,17 +235,26 @@ def copy_current_tree(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst, ignore=ignore)
 
 
-def _copy_untracked_into(cwd: Path, dst: Path) -> None:
+def list_untracked(cwd: Path) -> list[str]:
+    """Return the main tree's untracked, non-ignored paths (excluding our state)."""
+    if not is_git_repo(cwd):
+        return []
+    raw = git_bytes(cwd, ["ls-files", "--others", "--exclude-standard", "-z"])
+    out: list[str] = []
+    for entry in raw.split(b"\0"):
+        if not entry or entry.startswith(b".claude/wiggum-"):
+            continue
+        out.append(entry.decode("utf-8", errors="replace"))
+    return out
+
+
+def _copy_untracked_into(cwd: Path, dst: Path, untracked: list[str] | None = None) -> None:
     # Mirror the main tree's untracked files into the worktree WITHOUT touching
     # the main tree's git index. The `make_patch(cwd)` call above only captures
     # tracked changes (we refuse to `git add -N` on the main tree); without
     # this copy step the worktree would start without the user's new files
     # and the agent/verifier would operate on an incomplete project.
-    raw = git_bytes(cwd, ["ls-files", "--others", "--exclude-standard", "-z"])
-    for entry in raw.split(b"\0"):
-        if not entry or entry.startswith(b".claude/wiggum-"):
-            continue
-        rel = entry.decode("utf-8", errors="replace")
+    for rel in untracked if untracked is not None else list_untracked(cwd):
         src = cwd / rel
         if not src.is_file():
             continue
@@ -210,16 +266,28 @@ def _copy_untracked_into(cwd: Path, dst: Path) -> None:
             pass
 
 
-def create_candidate_workspace(cwd: Path, sandbox: str, iteration: int, candidate: int) -> tuple[Path, str, Path | None]:
+def create_candidate_workspace(
+    cwd: Path,
+    sandbox: str,
+    iteration: int,
+    candidate: int,
+    base_patch: str | None = None,
+    untracked: list[str] | None = None,
+) -> tuple[Path, str, Path | None]:
     tmp_root = Path(tempfile.mkdtemp(prefix=f"wiggum-i{iteration}-c{candidate}-"))
     if sandbox == "worktree" and is_git_repo(cwd) and has_head(cwd):
         worktree = tmp_root / "worktree"
-        result = run_git(cwd, ["worktree", "add", "--detach", str(worktree), "HEAD"], timeout=30)
+        # `git worktree add` mutates shared repo metadata (.git/worktrees, refs).
+        # Serialize it so concurrent best-of-N candidates can't race the index.
+        with _WORKTREE_LOCK:
+            result = run_git(cwd, ["worktree", "add", "--detach", str(worktree), "HEAD"], timeout=30)
         if result.get("exit_code") == 0:
-            base_patch = make_patch(cwd)
-            if base_patch.strip():
-                apply_patch(worktree, base_patch)
-            _copy_untracked_into(cwd, worktree)
+            # Reuse the per-iteration baseline when the caller precomputed it so
+            # we don't re-run `git diff`/`ls-files` once per candidate.
+            patch = base_patch if base_patch is not None else make_patch(cwd)
+            if patch.strip():
+                apply_patch(worktree, patch)
+            _copy_untracked_into(cwd, worktree, untracked)
             # Turn the caller's current tracked/untracked baseline into the
             # candidate's temporary HEAD so the candidate patch contains only
             # this worker's delta, not pre-existing local files like logs.
@@ -532,14 +600,14 @@ def build_iteration_prompt(core_prompt: str, args: argparse.Namespace, iteration
     return "\n".join(lines)
 
 
-def run_candidate(cwd: Path, core_prompt: str, args: argparse.Namespace, state: dict[str, Any], iteration: int, candidate_index: int, last_agent: dict[str, Any] | None, mutation_hint: str) -> dict[str, Any]:
+def run_candidate(cwd: Path, core_prompt: str, args: argparse.Namespace, state: dict[str, Any], iteration: int, candidate_index: int, last_agent: dict[str, Any] | None, mutation_hint: str, base_patch: str | None = None, untracked: list[str] | None = None) -> dict[str, Any]:
     needs_sandbox = args.sandbox != "none" or args.candidates > 1 or args.acceptance in {"verifier", "metric", "progress"}
     sandbox = args.sandbox if needs_sandbox else "none"
     candidate_cwd = cwd
     sandbox_kind = "none"
     sandbox_root: Path | None = None
     if sandbox != "none":
-        candidate_cwd, sandbox_kind, sandbox_root = create_candidate_workspace(cwd, sandbox, iteration, candidate_index)
+        candidate_cwd, sandbox_kind, sandbox_root = create_candidate_workspace(cwd, sandbox, iteration, candidate_index, base_patch=base_patch, untracked=untracked)
 
     memory_summary = "" if args.mode == "exact" else read_summary(cwd, args.summary_max_chars)
     prompt = build_iteration_prompt(core_prompt, args, iteration, int(state.get("stagnant_iterations") or 0), last_agent, memory_summary, mutation_hint)
@@ -747,6 +815,25 @@ def validate_agent_commands(commands: list[str], skip: bool) -> list[str]:
     return errors
 
 
+def explicitly_passed(parser: argparse.ArgumentParser, argv: list[str]) -> set[str]:
+    """Return the set of dest names the user actually passed on the command line.
+
+    argparse fills defaults into the parsed namespace, so a value of ``4`` could
+    mean "user passed 4" or "argparse default 4". To disambiguate we reparse the
+    same argv with every action's default suppressed; only user-supplied dests
+    appear in the resulting namespace.
+    """
+    saved = [(action, action.default) for action in parser._actions]
+    try:
+        for action, _ in saved:
+            action.default = argparse.SUPPRESS
+        parsed = parser.parse_args(argv, namespace=argparse.Namespace())
+    finally:
+        for action, default in saved:
+            action.default = default
+    return set(vars(parsed))
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run a true-isolated Wiggum loop using fresh agent subprocesses.")
     p.add_argument("prompt", nargs="*", help="Core prompt text")
@@ -790,14 +877,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--no-global-lessons", action="store_true", help="Deprecated alias kept for backwards compatibility; global lessons are now opt-in via --global-lessons")
     p.add_argument("--no-agent-validation", action="store_true", help="Skip the startup probe that runs each --agent-command with stdin to catch missing/broken commands")
     p.add_argument("--explain", action="store_true", default=False, help="Attach the per-round stuck reason signals to the iteration log entry")
-    p.add_argument("--notify", action="store_true", help="On macOS, display a desktop notification when the loop reaches a terminal state")
+    p.add_argument("--notify", action="store_true", help="Best-effort desktop notification on terminal states (macOS osascript, Linux notify-send, Windows PowerShell)")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
+    # Apply presets to flags the user did NOT pass explicitly. We can't tell an
+    # argparse default apart from a user-supplied value by inspecting the parsed
+    # namespace, so we reparse with every default suppressed: the keys that
+    # survive are exactly the ones the user provided on the command line.
+    explicit = explicitly_passed(p, argv)
     preset = PRESETS.get(args.preset, {})
     for key, value in preset.items():
-        if key == "review_required":
+        if key == "review_required" or not hasattr(args, key):
             continue
-        if getattr(args, key, None) in (None, "", 0, "reflective"):
+        if key not in explicit:
             setattr(args, key, value)
     if args.allow_infinite:
         args.max_iterations = 0
@@ -936,8 +1028,14 @@ def main(argv: list[str]) -> int:
         baseline_hash = _workspace_hash(cwd, wiggum_pathspec)
         candidate_indexes = list(range(1, args.candidates + 1))
         candidates: list[dict[str, Any]] = []
+        # Compute the worktree baseline (tracked diff + untracked file list) once
+        # per iteration instead of once per candidate; every candidate seeds from
+        # the same snapshot of the main tree.
+        use_worktree = args.sandbox == "worktree" and is_git_repo(cwd) and has_head(cwd)
+        iter_base_patch = make_patch(cwd) if use_worktree else None
+        iter_untracked = list_untracked(cwd) if use_worktree else None
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.candidate_concurrency, args.candidates)) as ex:
-            futures = [ex.submit(run_candidate, cwd, core_prompt, args, state, iteration, idx, last_agent, mutation_hint) for idx in candidate_indexes]
+            futures = [ex.submit(run_candidate, cwd, core_prompt, args, state, iteration, idx, last_agent, mutation_hint, iter_base_patch, iter_untracked) for idx in candidate_indexes]
             for fut in concurrent.futures.as_completed(futures):
                 candidates.append(fut.result())
         candidates.sort(key=lambda c: c.get("candidate", 0))
