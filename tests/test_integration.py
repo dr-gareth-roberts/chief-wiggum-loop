@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = PLUGIN_ROOT / "scripts"
 STOP_HOOK = PLUGIN_ROOT / "hooks" / "wiggum_stop_hook.py"
@@ -47,8 +49,8 @@ def _read_jsonl(path: Path) -> list[dict]:
         if line:
             try:
                 out.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as exc:
+                pytest.fail(f"malformed JSONL in {path}: {exc}\noffending line: {line!r}")
     return out
 
 
