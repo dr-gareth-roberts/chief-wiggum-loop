@@ -4,6 +4,8 @@ version = "0.3.0"
 description = "Progress-aware Ralph Wiggum loop automation for Claude Code"
 readme = "README.md"
 requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Gareth Roberts" }]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff", "mypy"]
