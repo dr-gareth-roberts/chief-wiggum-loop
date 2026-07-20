@@ -3,6 +3,6 @@
   "version": "0.3.0",
   "description": "Progress-aware Ralph Wiggum loop automation for Claude Code: same-core prompt iteration with verifier stop conditions, no-progress pause, JSON state, and an iteration ledger.",
   "author": {
-    "name": "K + Pi"
+    "name": "Gareth Roberts"
   }
 }
